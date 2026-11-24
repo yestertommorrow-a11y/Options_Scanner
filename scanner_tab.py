@@ -90,7 +90,7 @@ class ScannerTab(ttk.Frame):
             "min_vol": tk.StringVar(value="50"),
             "min_oi": tk.StringVar(value="10"),
             "uoa": tk.StringVar(value="1.0"),
-            "edge": tk.StringVar(value="15"),
+            "edge": tk.StringVar(value="5"),
             "spread": tk.StringVar(value="10"),
             "min_price": tk.StringVar(value="0.10"),
         }

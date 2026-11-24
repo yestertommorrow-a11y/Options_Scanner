@@ -86,6 +86,27 @@ def bs_theta_vega(S, K, T, r, q, sigma, is_call):
     return theta, vega
 
 
+def implied_vol(price, S, K, T, r, q, is_call, lo=1e-4, hi=5.0, iters=48):
+    """Vectorised Black-Scholes implied volatility by bisection.
+
+    Returns NaN where the price is outside what any volatility in [lo, hi] can produce
+    (for example below intrinsic value).
+    """
+    price = np.asarray(price, dtype=float)
+    K = np.broadcast_to(np.asarray(K, dtype=float), price.shape)
+    T = np.broadcast_to(np.asarray(T, dtype=float), price.shape)
+    is_call = np.broadcast_to(np.asarray(is_call, dtype=bool), price.shape)
+    a, b = np.full(price.shape, lo), np.full(price.shape, hi)
+    p_lo = bs_model(S, K, T, r, q, a, is_call)[0]
+    p_hi = bs_model(S, K, T, r, q, b, is_call)[0]
+    ok = np.isfinite(price) & (price > p_lo) & (price < p_hi)
+    for _ in range(iters):
+        m = (a + b) / 2.0
+        below = bs_model(S, K, T, r, q, m, is_call)[0] < price
+        a, b = np.where(below, m, a), np.where(below, b, m)
+    return np.where(ok, (a + b) / 2.0, np.nan)
+
+
 # --------------------------------------------------------------------------
 # 2. Data
 # --------------------------------------------------------------------------
@@ -164,6 +185,54 @@ def fetch_chain(ticker: str, min_dte: int, max_dte: int, max_expiries: int = 12)
 # --------------------------------------------------------------------------
 # 3. Preparation
 # --------------------------------------------------------------------------
+def parity_spot(df: pd.DataFrame, spot: float, r: float, q: float) -> pd.Series:
+    """Underlying price implied by each expiry's option quotes (put-call parity).
+
+    C - P = S*e^(-qT) - K*e^(-rT)  =>  S = (C - P + K*e^(-rT)) * e^(qT), using the 5 strikes
+    where call and put mids are closest (nearest the money). Yahoo's stock quote can be stale
+    (outside US hours it is the previous close while option quotes are not), and a spot that is
+    off by 1% skews every IV: puts look expensive and calls cheap. Falls back to the quoted
+    spot when an expiry has no two-sided call/put pair or the estimate is more than 10% away.
+    """
+    out = pd.Series(float(spot), index=df.index)
+    live = df[(df["bid"] > 0) & (df["ask"] > 0)]
+    for exp, g in live.groupby("expiry"):
+        T = max(float(g["dte"].iloc[0]), 0.5) / 365.0
+        c = g[g["type"] == "call"].groupby("strike")["mid"].mean()
+        p = g[g["type"] == "put"].groupby("strike")["mid"].mean()
+        both = c.index.intersection(p.index)
+        if len(both) < 1:
+            continue
+        diff = c[both] - p[both]
+        near = diff.abs().nsmallest(5).index
+        est = float(np.median((diff[near] + near.to_numpy() * math.exp(-r * T)) * math.exp(q * T)))
+        if 0.9 * spot < est < 1.1 * spot:
+            out[df["expiry"] == exp] = est
+    return out
+
+
+def fit_smile(e: pd.DataFrame, min_points: int = 6):
+    """Quadratic smile IV(k), k = ln(K/S), through one expiry's out-of-the-money live IVs.
+
+    Weighted by vega so liquid near-the-money points count most; one refit drops points more
+    than 3 robust standard deviations off the curve, so a single bad quote cannot bend it.
+    Returns polynomial coefficients for np.polyval, or None if there are too few points.
+    """
+    pts = e[e["otm"] & (e["iv_source"] == "mid") & e["delta"].abs().between(0.05, 0.95)
+            & (e["spread_pct"] <= 25)]
+    if len(pts) < min_points:
+        return None
+    k, iv = pts["moneyness"].to_numpy(), pts["iv"].to_numpy()
+    w = np.sqrt(np.maximum(pts["vega"].to_numpy(), 1e-8))
+    coef = np.polyfit(k, iv, 2, w=w)
+    resid = iv - np.polyval(coef, k)
+    mad = np.median(np.abs(resid - np.median(resid))) * 1.4826
+    keep = np.abs(resid) <= 3 * max(mad, 1e-4)
+    if keep.sum() >= min_points and not keep.all():
+        coef = np.polyfit(k[keep], iv[keep], 2, w=w[keep])
+    return coef
+
+
 def prepare_chain(raw: pd.DataFrame, spot: float, today=None,
                   r: float = RISK_FREE_RATE, q: float = DIVIDEND_YIELD) -> pd.DataFrame:
     """Normalise a yfinance-style chain and add mid, spread, delta, reference IV, edge."""
@@ -176,8 +245,7 @@ def prepare_chain(raw: pd.DataFrame, spot: float, today=None,
     df = df.rename(columns={"openInterest": "oi", "impliedVolatility": "iv", "lastPrice": "last"})
 
     df["dte"] = (df["expiry"] - today).dt.days
-    # yfinance returns near-zero IVs for dead contracts; drop them.
-    df = df[(df["dte"] >= 0) & (df["iv"] > 0.01) & (df["iv"] < 5) & (df["strike"] > 0)].copy()
+    df = df[(df["dte"] >= 0) & (df["strike"] > 0)].copy()
     if df.empty:
         return df.reset_index(drop=True)
 
@@ -187,19 +255,60 @@ def prepare_chain(raw: pd.DataFrame, spot: float, today=None,
         df["spread_pct"] = np.where(two_sided, (df["ask"] - df["bid"]) / df["mid"] * 100.0, np.nan)
         df["vol_oi"] = np.where(df["oi"] > 0, df["volume"] / df["oi"], np.nan)
 
+    # IV per strike, taken from the OUT-of-the-money option's live mid and shared with the
+    # in-the-money option at the same strike (standard practice for an IV surface):
+    # - solving from the mid keeps IV, greeks and edge consistent with the price shown
+    #   (Yahoo's impliedVolatility comes from other prices and can be points off the mid);
+    # - in-the-money US options are American and trade above European value, so IV solved
+    #   from their own price is inflated (often 100%+), which would also distort delta.
     T = np.maximum(df["dte"].to_numpy(dtype=float), 0.5) / 365.0
     is_call = (df["type"] == "call").to_numpy()
-    _, delta, gamma = bs_model(spot, df["strike"], T, r, q, df["iv"], is_call)
+    df["spot_used"] = parity_spot(df, spot, r, q)
+    S = df["spot_used"].to_numpy()
+    otm = np.where(is_call, df["strike"] >= S, df["strike"] <= S)
+    df["otm"] = otm
+    df["iv_yahoo"] = df["iv"]
+    own = implied_vol(np.where(two_sided, df["mid"], np.nan), S, df["strike"], T, r, q, is_call)
+    pair = (pd.Series(np.where(otm, own, np.nan), index=df.index)
+            .groupby([df["expiry"], df["strike"]]).transform("mean").to_numpy())
+    src = np.select([otm & np.isfinite(own), ~otm & np.isfinite(pair), np.isfinite(own)],
+                    ["mid", "pair", "mid"], default="yahoo")
+    df["iv_source"] = src
+    df["iv"] = np.select([src == "pair", src == "mid"], [pair, own], default=df["iv_yahoo"])
+    # yfinance returns near-zero or huge IVs for dead contracts; drop them.
+    keep = ((df["iv"] > 0.01) & (df["iv"] < 5)).to_numpy()
+    df, T, is_call, S = df[keep].copy(), T[keep], is_call[keep], S[keep]
+    if df.empty:
+        return df.reset_index(drop=True)
+    _, delta, gamma = bs_model(S, df["strike"], T, r, q, df["iv"], is_call)
     df["delta"], df["gamma"] = delta, gamma
-    df["theta"], df["vega"] = bs_theta_vega(spot, df["strike"], T, r, q, df["iv"], is_call)
+    df["theta"], df["vega"] = bs_theta_vega(S, df["strike"], T, r, q, df["iv"], is_call)
 
-    # Reference IV per expiry: median IV of near-the-money contracts (|delta| 0.3-0.7).
-    core = df[df["delta"].abs().between(0.3, 0.7)]
-    df["ref_iv"] = df["expiry"].map(core.groupby("expiry")["iv"].median())
-    theo, _, _ = bs_model(spot, df["strike"], T, r, q, df["ref_iv"], is_call)
+    # Reference IV = the expiry's smile, fitted through its out-of-the-money live IVs and read at this
+    # contract's own strike. Comparing with one at-the-money level instead flags every far call
+    # "Cheap" and every far put "Rich", because IV slopes along the curve (skew). Without enough
+    # points to fit, fall back to the median IV of near-the-money calls (or puts).
+    k = np.log(df["strike"].to_numpy() / S)
+    df["moneyness"] = k
+    df["ref_iv"] = np.nan
+    df["ref_method"] = ""
+    for exp, idx in df.groupby("expiry").groups.items():
+        fit = fit_smile(df.loc[idx])
+        if fit is not None:
+            df.loc[idx, "ref_iv"] = np.clip(np.polyval(fit, df.loc[idx, "moneyness"]), 0.01, 5.0)
+            df.loc[idx, "ref_method"] = "smile"
+    core = df[df["delta"].abs().between(0.3, 0.7) & df["otm"] & (df["iv_source"] == "mid")]
+    med = core.groupby(["expiry", "type"])["iv"].median()
+    fallback = pd.MultiIndex.from_arrays([df["expiry"], df["type"]]).map(med.get).astype(float)
+    need = df["ref_iv"].isna().to_numpy() & np.isfinite(fallback)
+    df.loc[need, "ref_iv"] = fallback[need]
+    df.loc[need, "ref_method"] = "median"
+    theo, _, _ = bs_model(S, df["strike"], T, r, q, df["ref_iv"], is_call)
     df["theo"] = theo
+    # Rich/Cheap is judged on out-of-the-money options only: in-the-money prices also carry
+    # intrinsic and early-exercise value that a European model does not price.
     with np.errstate(all="ignore"):
-        df["edge_pct"] = np.where(df["mid"] > 0, (df["theo"] - df["mid"]) / df["mid"] * 100.0, np.nan)
+        df["edge_pct"] = np.where((df["mid"] > 0) & df["otm"], (df["theo"] - df["mid"]) / df["mid"] * 100.0, np.nan)
 
     ad = df["delta"].abs()
     df["bucket"] = np.select(
@@ -212,13 +321,16 @@ def prepare_chain(raw: pd.DataFrame, spot: float, today=None,
 
 def summarize(chain: pd.DataFrame, spot: float, closes: pd.Series | None = None) -> dict:
     """Ticker-level read: ATM IV, 1-sigma expected move, 25-delta skew, IV vs realised vol."""
-    out: dict = {"spot": spot}
+    out: dict = {"spot": spot, "spot_quoted": spot}
     if chain.empty:
         return out
     dtes = sorted(chain["dte"].unique())
     pick = next((d for d in dtes if d >= 7), dtes[-1])
     e = chain[chain["dte"] == pick]
     out["dte"] = int(pick)
+    if "spot_used" in e:
+        spot = float(e["spot_used"].iloc[0])  # option-implied price for this expiry
+        out["spot"] = spot
 
     atm_strike = e.loc[(e["strike"] - spot).abs().idxmin(), "strike"]
     atm_iv = float(e.loc[e["strike"] == atm_strike, "iv"].mean())
@@ -264,7 +376,7 @@ class ScanConfig:
     min_volume: int = 50
     min_oi: int = 10
     uoa_ratio: float = 1.0       # volume / open interest
-    edge_pct: float = 15.0       # |theo - mid| / mid
+    edge_pct: float = 5.0        # |theo - mid| / mid, versus the fitted smile
     max_spread_pct: float = 10.0
     min_price: float = 0.10
     bucket: str = "All"

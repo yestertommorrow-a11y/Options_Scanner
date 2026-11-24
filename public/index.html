@@ -173,7 +173,7 @@
         <small>Skip contracts with fewer than this many open positions (as of last close).</small></label>
       <label><b>UOA Vol/OI &ge;</b><input name="uoa_ratio" type="number" min="0" required step="0.1" value="1.0">
         <small>Flag as unusual when today's volume is at least this multiple of open positions.</small></label>
-      <label><b>Edge % &ge;</b><input name="edge_pct" type="number" min="0" required step="1" value="15">
+      <label><b>Edge % &ge;</b><input name="edge_pct" type="number" min="0" required step="0.5" value="5">
         <small>Flag as mispriced when price differs from the model by at least this %.</small></label>
       <label><b>Max Spread %</b><input name="max_spread_pct" type="number" min="0" required step="0.5" value="10">
         <small>Widest bid-ask gap allowed, as % of price. Wide gaps cost you to trade.</small></label>
@@ -219,8 +219,8 @@
   </details>
 
   <p class="note">Yahoo data is delayed and open interest is end-of-day, so Vol/OI is a rough signal. Edge % compares the
-    market price with Black-Scholes at the expiry's typical (near-the-money) IV: it means "rich or cheap versus normal
-    vol for this expiry", not risk-free profit.</p>
+    market price with Black-Scholes at the IV a smooth smile, fitted through the expiry's out-of-the-money quotes, gives at
+    that strike: it means "rich or cheap versus the options around it", not risk-free profit.</p>
 </main>
 <script src="charts.js"></script>
 <script>
@@ -231,7 +231,7 @@ const MODES = [
   ["Unusual Activity", "Unusual activity (UOA)",
    "UOA = Unusual Options Activity. Lists contracts where today's volume is large compared with open interest (positions already open at last close). Volume well above OI suggests new money arriving today, sometimes a big trader positioning ahead of news."],
   ["Mispricing", "Mispricing (rich / cheap)",
-   "Prices each contract with Black-Scholes using the expiry's typical IV (the median IV of near-the-money contracts) and compares that with the market mid. Cheap = market below model; Rich = market above model. Only |delta| 0.2–0.8 is checked, to avoid far-out strikes where skew is normal."],
+   "Fits a smooth volatility smile through each expiry's out-of-the-money quotes, prices each contract with Black-Scholes at the smile's IV for its own strike, and compares that with the market mid. Cheap = market below the smile; Rich = market above it. Because the reference follows the smile, normal skew (puts carrying higher IV) is not reported as mispricing: only contracts out of line with their neighbours are. Only out-of-the-money options with |delta| 0.2–0.8 are judged: in-the-money prices include early-exercise value."],
   ["Tight Spreads", "Tight spreads (cheap to trade)",
    "Lists liquid contracts whose bid-ask gap is small. A tight spread means you lose little to the market maker when you buy and later sell."],
   ["Delta Bucket", "Delta bucket (group by payoff odds)",
@@ -265,13 +265,13 @@ const COLS = [
   ["volume", "Volume", num(0), false, "Contracts traded today."],
   ["oi", "OI", num(0), false, "Open interest: contracts still open at the last close (positions held overnight)."],
   ["vol_oi", "Vol/OI", num(1), false, "Volume ÷ open interest. Above 1 means more traded today than was open yesterday: unusual activity."],
-  ["iv", "IV %", v => v == null ? "" : num(1)(v * 100), false, "Implied volatility: how much movement per year the option price implies. Higher IV = pricier options."],
+  ["iv", "IV %", v => v == null ? "" : num(1)(v * 100), false, "Implied volatility: how much movement per year the option price implies, solved from the mid price. Higher IV = pricier options."],
   ["delta", "Delta", num(2, true), false, "Change in option price for a $1 move in the stock. Also a rough probability of finishing in the money."],
   ["gamma", "Gamma", num(4), false, "Change in delta per $1 move in the underlying."],
   ["theta", "Theta/day", num(3, true), false, "Time decay: how much the option loses per calendar day if nothing else changes (per share)."],
   ["vega", "Vega", num(3), false, "How much the option gains if IV rises by 1 point (e.g. 20% → 21%), per share."],
-  ["ref_iv", "Ref IV %", v => v == null ? "" : num(1)(v * 100), false, "Expiry reference IV: median IV of |delta| 0.30–0.70 contracts. Theo is priced at this vol."],
-  ["theo", "Theo", num(2), false, "Model (Black-Scholes) price using this expiry's typical IV."],
+  ["ref_iv", "Ref IV %", v => v == null ? "" : num(1)(v * 100), false, "Reference IV: the expiry's fitted smile read at this strike. Theo is priced at this vol."],
+  ["theo", "Theo", num(2), false, "Model (Black-Scholes) price at the smile's IV for this strike."],
   ["edge_pct", "Edge %", num(1, true), false, "(Theo − Mid) ÷ Mid. Positive = cheaper than the model (Cheap). Negative = dearer (Rich)."],
   ["spread_pct", "Spread %", num(1), false, "(Ask − Bid) ÷ Mid. The cost of trading; smaller is better."],
   ["bucket", "Bucket", v => v, true, "Delta group: Lotto (< 0.15), Sensible (0.15–0.35), Directional (0.35–0.65), Deep ITM (> 0.65)."],
@@ -303,7 +303,7 @@ const GUIDE = [
    "Sets the baseline: SPY IV is often 12–25%, a volatile single stock can be 50%+.",
    "Higher-IV underlyings have bigger premiums, so they also lose more dollars per day to decay."],
   ["Scan Type", "What you are hunting for.", "Activity (where is money flowing), value (rich or cheap), cost (spread) or risk profile (bucket).",
-   "Mispricing is purely an IV comparison: a contract's IV versus the typical IV of its expiry. Heavy buying (UOA) often pushes IV up.",
+   "Mispricing is purely an IV comparison: a contract's IV versus the smile's IV at its strike. Heavy buying (UOA) often pushes IV up.",
    "Buyers of flagged contracts pay time decay every day; sellers collect it."],
   ["Delta Bucket", "How far in or out of the money.", "Picks the payoff profile: cheap long shot vs. stock-like.",
    "Higher IV widens the range of likely prices, pushing out-of-the-money deltas up toward 0.5; low IV pushes them toward 0 (more Lotto).",
@@ -321,7 +321,7 @@ const GUIDE = [
    "Strong buying demand bids option prices up, which shows up as rising IV.",
    "New buyers start paying theta from day one; if it's short-dated, they need the move soon."],
   ["Edge % ≥", "How far from the model price before flagging.", "Finds options priced unusually high or low relative to their expiry.",
-   "Edge is an IV gap expressed in price: a contract's IV above the expiry's typical IV shows as Rich, below as Cheap. (Edge ≈ IV gap × vega ÷ price.)",
+   "Edge is an IV gap expressed in price: a contract's IV above the smile at its strike shows as Rich, below as Cheap. (Edge ≈ IV gap × vega ÷ price.)",
    "Short-dated options have small vega and small prices, so small IV gaps can show large edge %. Treat big edges near expiry with care."],
   ["Max Spread %", "Widest acceptable bid-ask gap.", "The spread is a guaranteed cost on every round trip.",
    "With a wide spread the mid is uncertain, so the IV and edge computed from it are unreliable.",
@@ -442,7 +442,9 @@ $("body").addEventListener("click", e => {
 // ---------- summary cards with working ----------
 function renderSummary(t, s) {
   const S = s.spot, cards = [];
-  cards.push(["Price (spot)", `$${f(S)}`, "Last traded price of the stock or ETF.", ""]);
+  cards.push(["Price (spot)", `$${f(S)}`,
+    "The price the option quotes imply, which every calculation uses. Yahoo's stock quote can lag, for example showing the previous close outside US hours.",
+    s.spot_quoted != null ? `call mid − put mid + strike × e^(−rT), nearest the money\nYahoo's stock quote: $${f(s.spot_quoted)}` : ""]);
   if (s.atm_iv != null) {
     const d = s.dte, T = Math.max(d, 0.5) / 365;
     cards.push([`ATM IV (${d}-day expiry)`, pct(s.atm_iv),
@@ -481,7 +483,7 @@ function renderSummary(t, s) {
 
 // ---------- per-contract working ----------
 function showWorking(r) {
-  const S = data.summary.spot, rr = data.r, q = data.q, cfg = data.config;
+  const S = r.spot_used ?? data.summary.spot, rr = data.r, q = data.q, cfg = data.config;
   const isCall = r.type === "call", K = r.strike, s = r.iv;
   const T = Math.max(r.dte, 0.5) / 365, sq = Math.sqrt(T);
   const dq = Math.exp(-q * T), dr = Math.exp(-rr * T);
@@ -514,7 +516,11 @@ function showWorking(r) {
     "The model works in years. Options expiring today are given half a day so the maths stays defined.");
 
   add("6. d1 and d2 (Black-Scholes inputs)",
-    `σ = this contract's IV = ${f(s, 4)}, r = ${f(rr, 3)}, q = ${f(q, 3)}\n` +
+    `σ = this contract's IV = ${f(s, 4)} ` +
+    (r.iv_source === "mid" ? `(solved so Black-Scholes gives exactly the mid${r.iv_yahoo != null ? `; Yahoo shows ${f(r.iv_yahoo, 4)}` : ""})`
+     : r.iv_source === "pair" ? `(taken from the out-of-the-money ${isCall ? "put" : "call"} at this strike: in-the-money prices include early-exercise value, which would inflate an IV solved from them)`
+     : "(Yahoo's figure: no live quote to solve from)") +
+    `\nr = ${f(rr, 3)}, q = ${f(q, 3)}\n` +
     `d1 = [ln(S/K) + (r − q + σ²/2)·T] ÷ (σ·√T)\n= [ln(${f(S)}/${f(K)}) + (${f(rr, 3)} − ${f(q, 3)} + ${f(s * s / 2, 4)})·${f(T, 5)}] ÷ (${f(s, 4)}·${f(sq, 4)})\n= [${f(Math.log(S / K), 4)} + ${f((rr - q + s * s / 2) * T, 5)}] ÷ ${f(s * sq, 4)} = ${f(d1, 4)}\n` +
     `d2 = d1 − σ·√T = ${f(d1, 4)} − ${f(s * sq, 4)} = ${f(d2, 4)}`,
     "d1 and d2 measure, in standard deviations, how far the strike is from the price after allowing for volatility and time. The bigger σ·√T, the more 'reachable' a far strike becomes.");
@@ -536,21 +542,26 @@ function showWorking(r) {
     `If IV rises 1 point (e.g. ${pct(s)} → ${pct(s + 0.01)}), the option gains about $${f(r.vega, 3)} per share. Vega grows with √T, so longer-dated options care more about IV; short-dated ones care more about time decay.`);
 
   if (r.ref_iv == null) {
-    add("10. Reference IV, theo and edge", "No contracts in this expiry had |delta| between 0.30 and 0.70, so there is no reference IV.",
+    add("10. Reference IV, theo and edge", `No ${r.type}s in this expiry had |delta| between 0.30 and 0.70, so there is no reference IV.`,
       "Theo and Edge % are left blank. This usually happens when quotes are missing (market closed).");
   } else {
     const [e1, e2] = d12(S, K, T, rr, q, r.ref_iv);
     const gap = (s - r.ref_iv) * 100;
-    add("10. Reference IV for this expiry", `Median IV of ${r.expiry} contracts with |Δ| 0.30–0.70 = ${pct(r.ref_iv, 2)}\nThis contract's IV = ${pct(s, 2)} → ${gap >= 0 ? "+" : ""}${f(gap, 1)} vol points vs reference`,
-      "The 'normal' volatility level for this expiry. A contract whose own IV is above it is priced richly, below it cheaply.");
+    add("10. Reference IV: the smile at this strike", (r.ref_method === "smile"
+        ? `Smile fitted through ${r.expiry}'s out-of-the-money IVs\n(a curve in moneyness k = ln(K/S), weighted toward liquid strikes)\nk = ln(${f(K)}/${f(S)}) = ${f(Math.log(K / S), 4)} → smile IV = ${pct(r.ref_iv, 2)}`
+        : `Too few quotes to fit a smile, so: median IV of ${r.expiry} out-of-the-money ${r.type}s with |Δ| 0.30–0.70 = ${pct(r.ref_iv, 2)}`) +
+      `\nThis contract's IV = ${pct(s, 2)} → ${gap >= 0 ? "+" : ""}${f(gap, 1)} vol points vs the smile`,
+      "The IV the options around this strike imply, so normal skew (puts carrying more IV than calls) is already built in. A contract above the smile is priced richly versus its neighbours, below it cheaply.");
     add("11. Theoretical price (at reference IV)",
       `d1 = ${f(e1, 4)}, d2 = ${f(e2, 4)} (step 6 with σ = ${f(r.ref_iv, 4)})\n` +
       (isCall ? `Theo = S·e^(−qT)·N(d1) − K·e^(−rT)·N(d2)\n= ${f(S)} × ${f(dq, 4)} × ${f(N(e1), 4)} − ${f(K)} × ${f(dr, 4)} × ${f(N(e2), 4)}`
               : `Theo = K·e^(−rT)·N(−d2) − S·e^(−qT)·N(−d1)\n= ${f(K)} × ${f(dr, 4)} × ${f(N(-e2), 4)} − ${f(S)} × ${f(dq, 4)} × ${f(N(-e1), 4)}`) +
       ` = ${f(r.theo, 3)}`,
-      "What Black-Scholes says this option is worth if it carried the expiry's normal IV.");
-    add("12. Edge %", `(Theo − Mid) ÷ Mid × 100\n= (${f(r.theo, 3)} − ${f(r.mid, 3)}) ÷ ${f(r.mid, 3)} × 100 = ${r.edge_pct > 0 ? "+" : ""}${f(r.edge_pct, 1)}%`,
-      (r.edge_pct > 0 ? "Positive: the market price is below the model, so it is 'Cheap' versus normal IV." : "Negative: the market price is above the model, so it is 'Rich' versus normal IV.") +
+      "What Black-Scholes says this option is worth at the smile's IV for its strike.");
+    if (r.edge_pct == null) add("12. Edge %", "Not calculated: this option is in the money.",
+      "Rich/Cheap is judged only on out-of-the-money options. An in-the-money price also carries intrinsic value and early-exercise value that the European model does not price, so comparing it with Theo would mislead.");
+    else add("12. Edge %", `(Theo − Mid) ÷ Mid × 100\n= (${f(r.theo, 3)} − ${f(r.mid, 3)}) ÷ ${f(r.mid, 3)} × 100 = ${r.edge_pct > 0 ? "+" : ""}${f(r.edge_pct, 1)}%`,
+      (r.edge_pct > 0 ? "Positive: the market price is below the smile's price, so it is 'Cheap' versus its neighbours." : "Negative: the market price is above the smile's price, so it is 'Rich' versus its neighbours.") +
       " Rough check: edge ≈ IV gap × vega ÷ mid. Edges in the hundreds or thousands of % usually mean a bad or stale quote, not a bargain.");
   }
 
@@ -570,7 +581,7 @@ function showWorking(r) {
     m === "UOA + Mispricing" ? "In the combined scan a contract needs to pass only one of the two tests (✓ on every item of that line)." : "Each listed contract passes every check on its scan's line.");
 
   $("workTitle").textContent = `How the numbers were worked out: ${data.ticker} ${r.expiry} $${f(K)} ${r.type}`;
-  $("workHint").textContent = `Spot S = ${f(S)}, strike K = ${f(K)}, risk-free rate r = ${pct(rr)}, dividend yield q = ${pct(q)}. Small differences in the last decimal come from rounding.`;
+  $("workHint").textContent = `Spot S = ${f(S)} (the price this expiry's option quotes imply, via put-call parity), strike K = ${f(K)}, risk-free rate r = ${pct(rr)}, dividend yield q = ${pct(q)}. Small differences in the last decimal come from rounding.`;
   $("steps").innerHTML = steps.map(([t, c, p]) =>
     `<div class="step"><h3>${esc(t)}</h3><div class="calc">${esc(c)}</div><p>${esc(p)}</p></div>`).join("");
   try { ScanCharts.contract($("contractCharts"), data, r); } catch (err) { console.error(err); $("contractCharts").textContent = ""; }
@@ -607,12 +618,18 @@ form.addEventListener("submit", async e => {
     data = d; rows = d.rows; sortKey = null; selected = null;
     renderSummary(d.ticker, d.summary);
     const stale = d.contracts && d.two_sided / d.contracts < 0.5;
-    $("warn").hidden = !stale;
-    $("warn").textContent = stale
-      ? `Warning: only ${d.two_sided} of ${d.contracts} contracts have a live bid and ask, so the US market is probably closed. ` +
-        "Yahoo then reports placeholder IVs, which push most deltas toward 0 (so most rows land in Lotto) and make IV, theo and edge unreliable. " +
-        "Scan during US market hours (9:30am–4pm New York time) for meaningful numbers."
-      : "";
+    const sq = d.summary.spot_quoted, si = d.summary.spot;
+    const spotGap = sq && si ? Math.abs(si - sq) / sq : 0;
+    const warns = [];
+    if (stale) warns.push(`Only ${d.two_sided} of ${d.contracts} contracts have a live bid and ask, so the US market is probably closed. ` +
+      "Contracts without a quote fall back to Yahoo's IV, which can be a placeholder, so IV, delta and edge are less reliable. " +
+      "Scan during US market hours (9:30am–4pm New York time) for the best numbers.");
+    if (spotGap > 0.003) warns.push(`Yahoo's stock price ($${sq.toFixed(2)}) differs from the price the option quotes imply ($${si.toFixed(2)}, ` +
+      `${(spotGap * 100).toFixed(1)}% apart), so the stock quote is probably stale (for example the previous close outside US hours). ` +
+      "All calculations use the option-implied price, found from put-call parity: call mid − put mid + discounted strike, at the strikes nearest the money.");
+    $("warn").hidden = !warns.length;
+    $("warn").textContent = warns.map(w => "Note: " + w).join("\n\n");
+    $("warn").style.whiteSpace = "pre-line";
     $("workBox").hidden = false;
     $("workTitle").textContent = "How the numbers were worked out";
     $("workHint").textContent = rows.length ? "Click any row in the results table to see its working here." : "No contracts matched. Try loosening the filters.";

@@ -18,7 +18,7 @@ Scan a US stock or ETF option chain for unusual activity, rich or cheap pricing,
 | Scan type | What it finds |
 |---|---|
 | Unusual Activity (UOA) | Contracts where today's volume is large relative to open interest (fresh positioning) |
-| Mispricing | Contracts priced rich or cheap versus Black-Scholes at the expiry's near-the-money IV |
+| Mispricing | Contracts priced rich or cheap versus a smooth volatility smile fitted through the expiry's quotes, read at the contract's own strike; out-of-the-money options only |
 | UOA + Mispricing | Either of the above, with both signals merged per contract |
 | Tight Spreads | Liquid contracts that are cheap to trade |
 | Delta Bucket | Lotto (< 0.15), Sensible (0.15–0.35), Directional (0.35–0.65), Deep ITM (> 0.65) |
@@ -89,5 +89,7 @@ Note: Yahoo sometimes rate-limits requests from cloud servers, so test the deplo
 ## Limitations
 
 - Yahoo data is delayed; open interest updates once a day, so Vol/OI is a rough signal.
-- "Rich" and "Cheap" compare a contract with its expiry's typical IV; far out-of-the-money puts often look rich because of normal skew.
+- "Rich" and "Cheap" mean out of line with the fitted smile at that strike, i.e. versus neighbouring options, not versus a fair value. A quadratic smile can misfit far wings, so treat wing signals with care.
+- Prices use the underlying price implied by the option quotes (put-call parity), because Yahoo's stock quote can be stale, e.g. the previous close outside US hours. The page warns when the two differ.
+- IV is solved from each strike's out-of-the-money mid price and shared with the in-the-money option at that strike (US options are American, so in-the-money prices carry early-exercise value). Without a live quote, Yahoo's IV is used.
 - Up to 12 expiries per scan, spread across the chosen DTE window.

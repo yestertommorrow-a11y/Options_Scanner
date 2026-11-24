@@ -28,7 +28,7 @@ CACHE_TTL = 120  # seconds; warm instances reuse a fetched chain for re-filterin
 _cache: dict = {}
 
 COLUMNS = ["type", "expiry", "dte", "strike", "bid", "ask", "last", "mid", "volume", "oi",
-           "vol_oi", "iv", "delta", "gamma", "theta", "vega", "ref_iv", "theo", "edge_pct",
+           "vol_oi", "iv", "iv_yahoo", "iv_source", "otm", "spot_used", "moneyness", "ref_method", "delta", "gamma", "theta", "vega", "ref_iv", "theo", "edge_pct",
            "spread_pct", "bucket", "signal"]
 
 
@@ -83,7 +83,7 @@ def scan(
     min_volume: int = Query(50, ge=0),
     min_oi: int = Query(10, ge=0),
     uoa_ratio: float = Query(1.0, ge=0),
-    edge_pct: float = Query(15.0, ge=0),
+    edge_pct: float = Query(5.0, ge=0),
     max_spread_pct: float = Query(10.0, ge=0),
     min_price: float = Query(0.10, ge=0),
 ):

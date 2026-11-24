@@ -29,7 +29,7 @@ def check(cond, msg):
         FAILS.append(msg)
 
 
-def synthetic_chain(seed: int, spot: float = 100.0, n_exp: int = 4) -> pd.DataFrame:
+def synthetic_chain(seed: int, spot: float = 100.0, n_exp: int = 4, junk: bool = True) -> pd.DataFrame:
     """A yfinance-shaped raw chain with skew, noise and the junk real data contains."""
     rng = np.random.default_rng(seed)
     rows = []
@@ -39,12 +39,12 @@ def synthetic_chain(seed: int, spot: float = 100.0, n_exp: int = 4) -> pd.DataFr
         T = max(dte, 0.5) / 365
         for K in np.arange(spot * 0.7, spot * 1.3 + 1e-9, spot * 0.025):
             for kind in ("call", "put"):
-                iv = 0.22 + 0.25 * max(0.0, (spot - K) / spot) + rng.normal(0, 0.01)
+                iv = 0.22 + 1.0 * max(0.0, (spot - K) / spot) + rng.normal(0, 0.005)
                 p, _, _ = sc.bs_model(spot, K, T, 0.045, 0.0, iv, kind == "call")
-                p = float(p) * rng.uniform(0.75, 1.25)
+                p = float(p) * rng.uniform(0.98, 1.02)  # IV is solved from this price, so keep noise modest
                 half = max(0.01, p * rng.uniform(0.005, 0.2))
                 bid, ask = max(p - half, 0.0), p + half
-                r = rng.random()
+                r = rng.random() if junk else 1.0
                 if r < 0.05:
                     bid = ask = 0.0                      # market closed / no quote
                 elif r < 0.08:
@@ -78,7 +78,32 @@ def test_pricing():
         check(abs(float(ve) - float(fd_ve)) < 1e-5, f"vega mismatch call={call}")
 
 
+def test_implied_vol():
+    rng = np.random.default_rng(11)
+    n = 400
+    S, K = 100.0, rng.uniform(60, 140, n)
+    T, iv = rng.uniform(1, 400, n) / 365, rng.uniform(0.05, 1.5, n)
+    call = rng.random(n) < 0.5
+    price = sc.bs_model(S, K, T, 0.045, 0.01, iv, call)[0]
+    got = sc.implied_vol(price, S, K, T, 0.045, 0.01, call)
+    vega = sc.bs_theta_vega(S, K, T, 0.045, 0.01, iv, call)[1]
+    sens = vega > 1e-6  # deep wings have ~zero vega: many IVs give the same price
+    check(np.all(np.abs(got[sens] - iv[sens]) < 1e-6), "implied_vol does not recover the IV")
+    # below the zero-volatility price, or above the price at 500% vol: no IV exists
+    floor = sc.bs_model(S, K, T, 0.045, 0.01, np.full(n, 1e-6), call)[0]
+    check(np.isnan(sc.implied_vol(floor - 0.05, S, K, T, 0.045, 0.01, call)).all(), "IV below the zero-vol price")
+    check(np.isnan(sc.implied_vol(np.full(n, S * 2), S, K, T, 0.045, 0.01, call)).all(), "IV for a price above the stock")
+
+
 def test_prepare(chain: pd.DataFrame, spot: float):
+    # IV solved from the mid reprices the mid, and then the edge has the sign of the IV gap
+    m = (chain["iv_source"] == "mid").to_numpy()
+    T = np.maximum(chain["dte"].to_numpy(dtype=float), 0.5) / 365
+    rep = sc.bs_model(chain["spot_used"].to_numpy(), chain["strike"], T, sc.RISK_FREE_RATE, sc.DIVIDEND_YIELD, chain["iv"], (chain["type"] == "call").to_numpy())[0]
+    check(np.allclose(rep[m], chain.loc[m, "mid"], rtol=1e-6, atol=1e-6), "mid-solved IV does not reprice the mid")
+    g = m & chain["ref_iv"].notna().to_numpy() & (chain["edge_pct"].abs() > 0.5).to_numpy()
+    check((np.sign(chain.loc[g, "edge_pct"]) == np.sign(chain.loc[g, "ref_iv"] - chain.loc[g, "iv"])).all(),
+          "edge sign disagrees with the IV gap")
     check(chain["iv"].between(0.01, 5, inclusive="neither").all(), "junk IVs not dropped")
     check((chain["dte"] >= 0).all(), "negative DTE kept")
     two = (chain["bid"] > 0) & (chain["ask"] > 0)
@@ -89,10 +114,64 @@ def test_prepare(chain: pd.DataFrame, spot: float):
     ad = chain["delta"].abs()
     want = np.select([ad < 0.15, ad < 0.35, ad < 0.65], ["Lotto", "Sensible", "Directional"], "Deep ITM")
     check((chain["bucket"] == want).all(), "bucket does not match delta rule")
-    ok = chain["mid"] > 0
+    ok = (chain["mid"] > 0) & chain["otm"]
     edge = (chain["theo"] - chain["mid"]) / chain["mid"] * 100
     check(np.allclose(chain.loc[ok, "edge_pct"], edge[ok], equal_nan=True), "edge % formula mismatch")
-    check(chain["theta"].dropna().le(1e-9).all() or True, "")  # theta can be >0 for deep ITM puts; no check
+    # reference IV = median IV of |delta| 0.3-0.7 contracts of the same expiry AND type
+    check(chain.loc[~chain["otm"], "edge_pct"].isna().all(), "in-the-money options must not get a Rich/Cheap edge")
+    otm = np.where(chain["type"] == "call", chain["strike"] >= chain["spot_used"], chain["strike"] <= chain["spot_used"])
+    check((chain["otm"].to_numpy() == otm).all(), "otm flag wrong")
+    itm_pair = chain[chain["iv_source"] == "pair"]
+    for r in itm_pair.head(50).itertuples():  # ITM IV comes from the OTM option at the same strike
+        twin = chain[(chain["expiry"] == r.expiry) & (chain["strike"] == r.strike) & chain["otm"]]
+        check(len(twin) and abs(twin["iv"].mean() - r.iv) < 1e-12, f"pair IV mismatch at {r.strike}")
+    # reference IV: the expiry's fitted smile at this strike, else the near-the-money median
+    for exp, e in chain.groupby("expiry"):
+        fit = sc.fit_smile(e)
+        sm = e[e["ref_method"] == "smile"]
+        if fit is not None:
+            want = np.clip(np.polyval(fit, sm["moneyness"]), 0.01, 5.0)
+            check(len(sm) == len(e) and np.allclose(sm["ref_iv"], want), f"smile reference wrong for {exp:%Y-%m-%d}")
+        else:
+            check(sm.empty, f"{exp:%Y-%m-%d} has no smile fit but rows say smile")
+
+
+def skewed_chain(spot=500.0, stale=1.0, bump=None):
+    """Clean quotes on a smooth index-style smile; IV depends on strike only (as parity requires).
+    bump=(dte, strike, type, factor) multiplies one contract's price to plant a real mispricing."""
+    rows = []
+    for dte in (7, 30):
+        exp = (TODAY + pd.Timedelta(days=dte)).strftime("%Y-%m-%d")
+        for K in np.arange(spot * 0.85, spot * 1.15 + 1e-9, 5):
+            k = math.log(K / spot)
+            iv = 0.20 - 0.6 * k + 1.5 * k * k  # puts' side higher: normal skew
+            for kind in ("call", "put"):
+                p = float(sc.bs_model(spot, K, dte / 365, 0.045, 0.0, iv, kind == "call")[0])
+                if bump and (dte, K, kind) == bump[:3]:
+                    p *= bump[3]
+                if p < 0.05:
+                    continue
+                rows.append(dict(strike=K, bid=round(p * 0.995, 2), ask=round(p * 1.005, 2), lastPrice=p,
+                                 volume=1000, openInterest=800, impliedVolatility=iv, type=kind, expiry=exp))
+    return sc.prepare_chain(pd.DataFrame(rows), spot * stale, TODAY)
+
+
+def test_skew_is_not_mispricing(stale: float = 1.0):
+    """Skew alone, even with a stale stock quote, must produce no Rich/Cheap signals at all.
+    (The original code flagged 12-13 calls Cheap here with a 1.3% stale quote.)"""
+    out = sc.run_scans(skewed_chain(stale=stale), sc.ScanConfig(), "Mispricing")
+    check(len(out) == 0, f"skew with quote x{stale} flagged {len(out)} contracts "
+                         f"({(out['type'] == 'call').sum()} calls, {(out['type'] == 'put').sum()} puts)")
+
+
+def test_finds_real_mispricing():
+    """A single contract priced 30% off the smile is flagged, in the right direction, and nothing else is."""
+    for kind, K, factor, sign in (("put", 485.0, 1.3, "Rich"), ("call", 515.0, 0.7, "Cheap")):
+        out = sc.run_scans(skewed_chain(bump=(30, K, kind, factor)), sc.ScanConfig(), "Mispricing")
+        got = list(zip(out["type"], out["strike"]))
+        check(got == [(kind, K)], f"planted {sign} {kind} {K}: scan returned {got}")
+        if len(out):
+            check(out["signal"].iloc[0].startswith(sign), f"planted {kind} {K} labelled {out['signal'].iloc[0]}")
 
 
 def rule(df: pd.DataFrame, cfg: sc.ScanConfig, mode: str) -> pd.Series:
@@ -127,12 +206,27 @@ def test_scans(chain: pd.DataFrame, trials: int = 300):
         check(list(out["volume"]) == sorted(out["volume"], reverse=True), f"{tag}: not sorted by volume")
 
 
+def test_parity_spot():
+    """A stale stock quote must not move the prices: the option quotes imply the real spot."""
+    true_spot = 100.0
+    raw = synthetic_chain(21, true_spot, junk=False)
+    for quoted in (true_spot, true_spot * 1.02, true_spot * 0.985):
+        ch = sc.prepare_chain(raw, quoted, TODAY)
+        est = ch.groupby("expiry")["spot_used"].first()
+        check((est.sub(true_spot).abs() / true_spot < 0.003).all(),
+              f"quoted {quoted:.2f}: implied spots {est.round(2).tolist()} not near {true_spot}")
+    # without call/put pairs, fall back to the quoted price
+    calls_only = raw[raw["type"] == "call"]
+    ch = sc.prepare_chain(calls_only, 101.0, TODAY)
+    check((ch["spot_used"] == 101.0).all(), "no parity pairs should fall back to the quoted spot")
+
+
 def test_edge_cases():
     empty = sc.prepare_chain(synthetic_chain(1).iloc[0:0], 100.0, TODAY)
     for mode in sc.MODES:
         out = sc.run_scans(empty, sc.ScanConfig(), mode)
         check(len(out) == 0, f"empty chain gave rows in {mode}")
-    check(sc.summarize(empty, 100.0) == {"spot": 100.0}, "summary of empty chain")
+    check(sc.summarize(empty, 100.0) == {"spot": 100.0, "spot_quoted": 100.0}, "summary of empty chain")
     # all contracts expired
     raw = synthetic_chain(2)
     raw["expiry"] = (TODAY - pd.Timedelta(days=3)).strftime("%Y-%m-%d")
@@ -159,7 +253,7 @@ def test_summary(chain: pd.DataFrame, spot: float):
     closes = pd.Series(100 * np.exp(np.cumsum(np.random.default_rng(5).normal(0, 0.01, 60))))
     s = sc.summarize(chain, spot, closes)
     check(s["dte"] >= 7 or s["dte"] == chain["dte"].max(), "summary expiry rule")
-    check(abs(s["exp_move"] - spot * s["atm_iv"] * math.sqrt(max(s["dte"], 0.5) / 365)) < 1e-9, "expected move formula")
+    check(abs(s["exp_move"] - s["spot"] * s["atm_iv"] * math.sqrt(max(s["dte"], 0.5) / 365)) < 1e-9, "expected move formula")
     check(s["skew_25d"] > 0, "synthetic chain has put skew but skew_25d <= 0")
     check(abs(s["iv_rv"] - s["atm_iv"] / s["rv20"]) < 1e-12, "IV/RV ratio")
     check(abs(s["skew_25d"] - (s["p25_iv"] - s["c25_iv"]) * 100) < 1e-9, "skew = put IV - call IV")
@@ -195,6 +289,7 @@ def test_tkinter_tab(chain: pd.DataFrame):
 
 if __name__ == "__main__":
     test_pricing()
+    test_implied_vol()
     test_tkinter_tab(sc.prepare_chain(synthetic_chain(9), 100.0, TODAY))
     for seed in range(5):
         spot = [100.0, 722.29, 15.5, 2500.0, 48.0][seed]
@@ -204,6 +299,11 @@ if __name__ == "__main__":
         test_scans(ch, 120)
         test_summary(ch, spot)
     test_edge_cases()
+    test_skew_is_not_mispricing()
+    test_skew_is_not_mispricing(stale=1.013)  # Yahoo's previous close vs live options, as seen on SPY
+    test_skew_is_not_mispricing(stale=0.99)
+    test_finds_real_mispricing()
+    test_parity_spot()
     if FAILS:
         print(f"{len(FAILS)} FAILED")
         for f in FAILS[:25]:

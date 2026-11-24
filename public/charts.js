@@ -218,14 +218,26 @@
       svgEl("line", { x1: v.X, x2: v.X, y1: 14 + v.row * 12, y2: H - m.b, class: "ref" }, svg);
       svgEl("text", { x: v.X, y: 10 + v.row * 12, class: "rlabel", "text-anchor": v.anchor }, svg).textContent = v.label;
     }
+    // Dot labels try below/above and left/right of their dot, and take the first spot that stays
+    // inside the plot and does not overlap another label (or a horizontal-line label).
+    const placed = (o.hlines || []).filter(h => h.label).map(h => {
+      const w = h.label.length * 6.3, y = sy(h.y) - 5;
+      return [W - m.r - w, W - m.r, y - 11, y + 3];
+    });
     for (const d of o.dots || []) {
       if (!isFinite(d.x) || !isFinite(d.y) || d.x < Math.min(x0, x1) || d.x > Math.max(x0, x1)) continue;
       const X = sx(d.x), Y = sy(d.y);
       svgEl("circle", { cx: X, cy: Y, r: 5, fill: d.color, class: "dot" }, svg);
       if (d.label) {
-        const right = X > m.l + pw * 0.62;
-        const below = d.below ? Y + 20 < H - m.b : Y - 18 < m.t;  // flip when the label would hit an edge
-        svgEl("text", { x: X + (right ? -9 : 9), y: Y + (below ? 15 : -8), class: "dlabel", "text-anchor": right ? "end" : "start" }, svg).textContent = d.label;
+        const w = d.label.length * 6.6, right0 = X > m.l + pw * 0.62;
+        const box = (below, right) => { const x = X + (right ? -9 - w : 9), y = Y + (below ? 15 : -8); return [x, x + w, y - 11, y + 3]; };
+        const fits = b => b[0] >= 0 && b[1] <= W && b[2] >= m.t - 4 && b[3] <= H - m.b + 2 &&
+          !placed.some(p => b[0] < p[1] && b[1] > p[0] && b[2] < p[3] && b[3] > p[2]);
+        const tries = [];
+        for (const below of (d.below ? [true, false] : [false, true])) for (const right of [right0, !right0]) tries.push([below, right]);
+        const [bl, rt] = tries.find(t => fits(box(...t))) || tries[0];
+        placed.push(box(bl, rt));
+        svgEl("text", { x: X + (rt ? -9 : 9), y: Y + (bl ? 15 : -8), class: "dlabel", "text-anchor": rt ? "end" : "start" }, svg).textContent = d.label;
       }
     }
 
@@ -393,7 +405,7 @@
           caption: `Each line is the volatility the market charges at each strike. Far puts average about ${pAvg.toFixed(0)}% IV versus ${cAvg.toFixed(0)}% for far calls` +
             (pAvg > cAvg ? ": investors pay extra for crash protection, so the curve tilts up to the left. That tilt is skew." : ": calls are unusually expensive, so the market is leaning toward big upside moves.") +
             (dots.length ? ` The 25-delta skew card is the height gap between the two dots (${(s.p25_iv * 100).toFixed(1)}% − ${(s.c25_iv * 100).toFixed(1)}%).` : "") +
-            " It also explains Rich/Cheap: the reference IV is the middle of this curve, so far puts often look Rich.",
+            " Rich/Cheap fits a smooth curve through these points and flags only contracts that sit off it, so the tilt itself is never called mispricing.",
         });
       } else smileHost.textContent = "";
 
@@ -439,7 +451,7 @@
   // =====================================================================
   function contract(root, d, row) {
     root.textContent = "";
-    const S = d.summary.spot, r = d.r, q = d.q, K = row.strike, isCall = row.type === "call";
+    const S = row.spot_used ?? d.summary.spot, r = d.r, q = d.q, K = row.strike, isCall = row.type === "call";
     const iv = row.iv, mid = row.mid, T = Math.max(row.dte, 0.5) / 365;
     if (!(isFinite(mid) && mid > 0 && isFinite(iv) && iv > 0)) {
       htmlEl("p", "note", root, "Charts need a positive price and IV; this contract has no usable quote.");
@@ -531,18 +543,20 @@
       const lo = Math.max(0.01, 0.3 * Math.min(iv, ref || iv)), hi = Math.max(1.8 * top, lo + 0.1);
       const pts = range(lo, hi, 121).map(s => [s * 100, bs(S, K, T, r, q, s, isCall)]);
       const dots = [{ x: iv * 100, y: bs(S, K, T, r, q, iv, isCall), color: C1, label: "This contract's IV" }];
-      if (ref != null) dots.push({ x: ref * 100, y: row.theo, color: C2, label: "Expiry's normal IV", below: true });
+      if (ref != null) dots.push({ x: ref * 100, y: row.theo, color: C2, label: "Smile IV at this strike", below: true });
       lineChart(htmlEl("div", "", grid), {
         title: "How implied volatility sets the price",
-        sub: ref != null ? `Reference IV ${pc(ref)} · this contract ${pc(iv)}` : `This contract ${pc(iv)} · no reference IV for this expiry`,
+        sub: ref != null ? `Smile IV at this strike ${pc(ref)} · this contract ${pc(iv)}` : `This contract ${pc(iv)} · no reference IV for this expiry`,
         series: [{ name: "Model price", color: C1, pts }],
         hlines: [{ y: mid, label: `Market mid ${usd(mid)}` }], dots, yZero: true,
         xTitle: "Implied volatility", yTitle: "Option price per share", fmtX: v => v.toFixed(0) + "%", fmtY: v => usd(v),
         tip: (x, near) => ({ header: `IV ${x.toFixed(1)}%`, rows: [{ color: C1, value: usd(near[0][1]), label: "model price" }] }),
         caption: `Higher IV means more expected movement, so the price curve rises. Its slope is vega: about ${usd(row.vega, 3)} per IV point here. ` +
           (ref == null ? "There is no reference IV for this expiry, so no Rich/Cheap verdict." :
-            `The orange dot prices the option at this expiry's normal IV: ${usd(row.theo)}. The market mid is ${usd(mid)}, so edge = ${row.edge_pct > 0 ? "+" : ""}${row.edge_pct.toFixed(1)}%: ` +
-            (row.edge_pct > 0 ? "the market charges less than normal vol implies (Cheap)." : "the market charges more than normal vol implies (Rich)."))
+           row.edge_pct == null ? `The orange dot prices the option at the smile's IV for this strike: ${usd(row.theo)}. ` +
+            "No Rich/Cheap verdict: the option is in the money, and its price includes early-exercise value the model does not capture." :
+            `The orange dot prices the option at the smile's IV for this strike: ${usd(row.theo)}. The market mid is ${usd(mid)}, so edge = ${row.edge_pct > 0 ? "+" : ""}${row.edge_pct.toFixed(1)}%: ` +
+            (row.edge_pct > 0 ? "the market charges less than the options around it imply (Cheap)." : "the market charges more than the options around it imply (Rich)."))
           + " The horizontal distance between the dots is the IV gap that edge % expresses in dollars.",
       });
     }
