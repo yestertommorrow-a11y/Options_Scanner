@@ -1,0 +1,666 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Options Scanner</title>
+<script>
+  try { const t = localStorage.getItem("scannerTheme"); if (t === "light" || t === "dark") document.documentElement.dataset.theme = t; } catch (e) {}
+</script>
+<style>
+  :root {
+    --bg: #f6f7f9; --panel: #ffffff; --text: #1b1f24; --muted: #5d6673; --soft: #eef1f5;
+    --border: #d9dde3; --accent: #1f6feb; --pos: #137a3a; --neg: #b42318; --row: #f1f3f6; --sel: #dbe8ff;
+    --mono: ui-monospace, "Cascadia Mono", Consolas, monospace;
+    --s1: #2a78d6; --s2: #eb6834; --grid: #e6e9ee; color-scheme: light;
+  }
+  /* Dark: follows the OS unless the Sunny/Dark button picked a theme (data-theme on <html>). */
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) { --bg: #0f1216; --panel: #171b21; --text: #e6e9ee; --muted: #98a2b0; --soft: #1f252e;
+            --border: #2a303a; --accent: #4c8dff; --pos: #4cc277; --neg: #ff7b72; --row: #1c2129; --sel: #1d3357;
+            --s1: #3987e5; --s2: #d95926; --grid: #252b34; color-scheme: dark; }
+  }
+  :root[data-theme="dark"] { --bg: #0f1216; --panel: #171b21; --text: #e6e9ee; --muted: #98a2b0; --soft: #1f252e;
+            --border: #2a303a; --accent: #4c8dff; --pos: #4cc277; --neg: #ff7b72; --row: #1c2129; --sel: #1d3357;
+            --s1: #3987e5; --s2: #d95926; --grid: #252b34; color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+         font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  main { max-width: 1400px; margin: 0 auto; padding: 16px; }
+  h1 { font-size: 18px; margin: 0 0 4px; }
+  h2 { font-size: 15px; margin: 0 0 8px; }
+  .sub { color: var(--muted); margin: 0 0 12px; }
+  fieldset { background: var(--panel); border: 1px solid var(--border); border-radius: 8px;
+             padding: 12px; margin: 0 0 10px; display: grid; gap: 12px 14px;
+             grid-template-columns: repeat(auto-fill, minmax(170px, 1fr)); }
+  legend { color: var(--muted); padding: 0 4px; }
+  label { display: flex; flex-direction: column; gap: 3px; font-size: 12px; color: var(--muted); }
+  label b { color: var(--text); font-weight: 600; }
+  label small { font-size: 11px; line-height: 1.3; }
+  input, select { font: inherit; color: var(--text); background: var(--bg);
+                  border: 1px solid var(--border); border-radius: 6px; padding: 6px 8px; width: 100%; }
+  .bar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 8px; }
+  button { font: inherit; border: 1px solid var(--border); background: var(--panel); color: var(--text);
+           border-radius: 6px; padding: 7px 14px; cursor: pointer; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  button:disabled { opacity: .5; cursor: default; }
+  #status { color: var(--muted); }
+  #status.err, .neg { color: var(--neg); }
+  .pos { color: var(--pos); }
+  .box { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 12px; margin: 0 0 10px; }
+  #modeHelp { color: var(--muted); margin: -2px 0 10px; }
+  #warn { border-color: var(--neg); color: var(--neg); }
+  .cards { display: grid; gap: 10px; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); }
+  .card { background: var(--soft); border-radius: 6px; padding: 10px; }
+  .card .k { font-size: 12px; color: var(--muted); }
+  .card .v { font-size: 18px; font-weight: 600; }
+  .card p { margin: 4px 0 0; font-size: 12px; }
+  .calc { font-family: var(--mono); font-size: 12px; background: var(--bg); border-radius: 4px;
+          padding: 4px 6px; margin-top: 4px; white-space: pre-wrap; overflow-wrap: anywhere; }
+  .steps { display: grid; gap: 10px; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); }
+  .step { background: var(--soft); border-radius: 6px; padding: 10px; }
+  .step h3 { margin: 0; font-size: 13px; }
+  .step p { margin: 4px 0 0; font-size: 12px; color: var(--muted); }
+  .wrap { overflow: auto; max-height: 70vh; background: var(--panel);
+          border: 1px solid var(--border); border-radius: 8px; }
+  table { border-collapse: collapse; width: 100%; font-variant-numeric: tabular-nums; }
+  th, td { padding: 5px 8px; white-space: nowrap; text-align: right; border-bottom: 1px solid var(--border); }
+  #grid th { position: sticky; top: 0; background: var(--panel); cursor: pointer; user-select: none; font-weight: 600;
+             text-decoration: underline dotted var(--muted); text-underline-offset: 3px; }
+  th.l, td.l { text-align: left; }
+  th.sorted::after { content: attr(data-dir); color: var(--muted); }
+  #grid tbody tr { cursor: pointer; }
+  #grid tbody tr:nth-child(even) { background: var(--row); }
+  #grid tbody tr.sel { background: var(--sel); }
+  details { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; margin: 10px 0; }
+  summary { cursor: pointer; font-weight: 600; }
+  .guide { overflow-x: auto; margin-top: 10px; }
+  .guide table th, .guide table td { text-align: left; white-space: normal; vertical-align: top; min-width: 150px; }
+  .guide table th:first-child, .guide table td:first-child { min-width: 110px; font-weight: 600; }
+  dl { margin: 10px 0 0; display: grid; grid-template-columns: minmax(110px, max-content) 1fr; gap: 6px 14px; }
+  dt { font-weight: 600; } dd { margin: 0; }
+  .note { color: var(--muted); font-size: 12px; }
+  [hidden] { display: none !important; }
+  .top { display: flex; justify-content: space-between; align-items: center; gap: 8px 16px; flex-wrap: wrap; margin-bottom: 4px; }
+  .top h1 { margin: 0; }
+  .topbtns { display: flex; gap: 8px; flex-wrap: wrap; }
+  .viewtag { font-size: 12px; font-weight: 600; color: var(--muted); border: 1px solid var(--border);
+             border-radius: 999px; padding: 1px 8px; margin-left: 8px; vertical-align: middle; }
+  /* Pro view: dense, no teaching text */
+  body.pro label small, body.pro #modeHelp, body.pro .sub, body.pro .card p, body.pro .card .calc,
+  body.pro .step p, body.pro .learn, body.pro #workHint { display: none; }
+  body.pro fieldset { gap: 8px 10px; grid-template-columns: repeat(auto-fill, minmax(125px, 1fr)); }
+  body.pro .cards { grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 6px; }
+  body.pro .card { padding: 6px 10px; }
+  body.pro .card .v { font-size: 16px; }
+  body.pro .steps { grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 6px; }
+  body.pro .step { padding: 6px 8px; }
+  body.pro th, body.pro td { padding: 4px 6px; }
+
+  /* ---------- charts (palette validated for CVD in light and dark) ---------- */
+  .charts { display: grid; gap: 10px; grid-template-columns: repeat(auto-fill, minmax(min(100%, 400px), 1fr)); margin-top: 10px; }
+  .chart { background: var(--soft); border-radius: 6px; padding: 10px 12px; min-width: 0; }
+  .chart:empty { display: none; }
+  .chart h3 { margin: 0; font-size: 13px; }
+  .chart-sub { font-size: 12px; color: var(--muted); }
+  .plot { position: relative; margin-top: 4px; }
+  .plot svg { display: block; width: 100%; height: auto; overflow: visible; }
+  .plot .grid { stroke: var(--grid); stroke-width: 1; }
+  .plot .axis { stroke: var(--border); stroke-width: 1; }
+  .plot .zero { stroke: var(--muted); stroke-width: 1; }
+  .plot .ref { stroke: var(--muted); stroke-width: 1; stroke-opacity: .7; }
+  .plot .cross { stroke: var(--text); stroke-width: 1; stroke-opacity: .5; }
+  .plot .tick { fill: var(--muted); font-size: 11px; }
+  .plot .axt { fill: var(--muted); font-size: 11px; }
+  .plot .rlabel { fill: var(--text); font-size: 11px; }
+  .plot .dlabel { fill: var(--text); font-size: 11px; font-weight: 600; }
+  .plot .flag { fill: var(--text); font-size: 9px; }
+  .plot .dot { stroke: var(--soft); stroke-width: 2; }
+  .plot .hov { fill: var(--text); fill-opacity: .06; }
+  .tip { position: absolute; z-index: 2; pointer-events: none; background: var(--panel); border: 1px solid var(--border);
+         border-radius: 6px; padding: 6px 8px; font-size: 12px; box-shadow: 0 2px 8px rgba(0,0,0,.15); max-width: 260px; }
+  .tip-h { color: var(--muted); margin-bottom: 2px; }
+  .tip-r { display: flex; align-items: center; gap: 6px; white-space: nowrap; }
+  .tip-l { color: var(--muted); }
+  .key { display: inline-block; width: 12px; height: 2px; border-radius: 1px; flex: none; }
+  .key.rect { height: 10px; width: 10px; border-radius: 2px; }
+  .legend { display: flex; flex-wrap: wrap; gap: 4px 14px; font-size: 12px; color: var(--muted); margin-top: 4px; }
+  .legend > span { display: inline-flex; align-items: center; gap: 6px; }
+  .cap { font-size: 12px; margin: 6px 0 0; }
+  .chartctl { display: flex; flex-wrap: wrap; gap: 8px 16px; margin-top: 12px; font-size: 12px; color: var(--muted); }
+  .chartctl select { width: auto; padding: 3px 6px; }
+  #workBox h2 + p + .charts { margin-bottom: 12px; }
+  body.pro .cap { display: none; }
+  .chart-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 8px; }
+  .maxbtn { padding: 2px 8px; font-size: 12px; flex: none; }
+  .chart.max { position: fixed; inset: 3vh max(3vw, 12px); z-index: 50; overflow: auto; background: var(--panel);
+               border: 1px solid var(--border); padding: 16px 20px; box-shadow: 0 12px 40px rgba(0,0,0,.35); }
+  .chart.max h3 { font-size: 16px; }
+  .chart.max .cap { font-size: 14px; max-width: 900px; }
+  .chart.max .plot .tick, .chart.max .plot .axt, .chart.max .plot .rlabel { font-size: 12px; }
+  .chart-backdrop { position: fixed; inset: 0; background: rgba(0,0,0,.5); z-index: 49; }
+  body.noscroll { overflow: hidden; }
+</style>
+</head>
+<body>
+<main>
+  <div class="top">
+    <h1>Options Scanner <span class="viewtag" id="viewTag">Beginner view</span></h1>
+    <div class="topbtns">
+      <button id="themeBtn" type="button" title="Switch between sunny (light) and dark colours">☀️ Sunny</button>
+      <button id="viewBtn" type="button" title="Switch between plain-English explanations and a dense trader layout">Switch to Pro view</button>
+    </div>
+  </div>
+  <p class="sub">Finds option contracts worth a closer look. Grey hints explain each setting, column headings explain on hover,
+    and clicking any result row shows step by step how its numbers were worked out. A learning tool, not financial advice.</p>
+
+  <form id="f">
+    <fieldset>
+      <legend>Scan Settings</legend>
+      <label><b>Ticker</b><input name="ticker" value="SPY" required maxlength="12" autocapitalize="characters">
+        <small>The stock or ETF whose options you want to scan, e.g. SPY, AAPL.</small></label>
+      <label><b>Scan Type</b><select name="mode"></select>
+        <small>What kind of contract to look for. Explained below the buttons.</small></label>
+      <label><b>Delta Bucket</b><select name="bucket"></select>
+        <small>Group by how likely the option is to pay off. Used by the Delta Bucket scan.</small></label>
+      <label><b>Min DTE</b><input name="min_dte" type="number" min="0" max="730" step="1" required value="0">
+        <small>Days to expiry, lowest. 0 includes options expiring today.</small></label>
+      <label><b>Max DTE</b><input name="max_dte" type="number" min="0" max="730" step="1" required value="45">
+        <small>Days to expiry, highest. Time decay is fastest in the last ~30 days.</small></label>
+      <label><b>Min Volume</b><input name="min_volume" type="number" min="0" required value="50">
+        <small>Skip contracts that traded fewer than this many today (illiquid).</small></label>
+      <label><b>Min Open Interest</b><input name="min_oi" type="number" min="0" required value="10">
+        <small>Skip contracts with fewer than this many open positions (as of last close).</small></label>
+      <label><b>UOA Vol/OI &ge;</b><input name="uoa_ratio" type="number" min="0" required step="0.1" value="1.0">
+        <small>Flag as unusual when today's volume is at least this multiple of open positions.</small></label>
+      <label><b>Edge % &ge;</b><input name="edge_pct" type="number" min="0" required step="1" value="15">
+        <small>Flag as mispriced when price differs from the model by at least this %.</small></label>
+      <label><b>Max Spread %</b><input name="max_spread_pct" type="number" min="0" required step="0.5" value="10">
+        <small>Widest bid-ask gap allowed, as % of price. Wide gaps cost you to trade.</small></label>
+      <label><b>Min Mid Price</b><input name="min_price" type="number" min="0" required step="0.05" value="0.10">
+        <small>Ignore options cheaper than this per share ($0.10 = $10 per contract).</small></label>
+    </fieldset>
+    <div class="bar">
+      <button class="primary" id="scan" type="submit">Fetch &amp; Scan</button>
+      <button id="export" type="button" disabled>Export CSV</button>
+      <span id="status">Enter a ticker and press Fetch &amp; Scan.</span>
+    </div>
+    <div id="modeHelp"></div>
+  </form>
+
+  <div class="box" id="warn" hidden></div>
+
+  <section class="box" id="sumBox" hidden>
+    <h2>Market read for <span id="sumTicker"></span></h2>
+    <div class="cards" id="cards"></div>
+    <div id="marketCharts"></div>
+  </section>
+
+  <section class="box" id="workBox" hidden>
+    <h2 id="workTitle">How the numbers were worked out</h2>
+    <p class="note" id="workHint">Click any row in the results table to see its working here.</p>
+    <div id="contractCharts"></div>
+    <div class="steps" id="steps"></div>
+  </section>
+
+  <div class="wrap"><table id="grid"><thead><tr id="head"></tr></thead><tbody id="body"></tbody></table></div>
+
+  <details id="guide" class="learn" open>
+    <summary>Field guide: what each setting does, and how it ties to implied volatility and time decay</summary>
+    <div class="guide"><table>
+      <thead><tr><th>Setting</th><th>In plain words</th><th>Why a trader cares</th><th>Link to implied volatility (IV)</th><th>Link to time decay (theta)</th></tr></thead>
+      <tbody id="guideBody"></tbody>
+    </table></div>
+  </details>
+
+  <details class="learn">
+    <summary>Glossary</summary>
+    <dl id="gloss"></dl>
+  </details>
+
+  <p class="note">Yahoo data is delayed and open interest is end-of-day, so Vol/OI is a rough signal. Edge % compares the
+    market price with Black-Scholes at the expiry's typical (near-the-money) IV: it means "rich or cheap versus normal
+    vol for this expiry", not risk-free profit.</p>
+</main>
+<script src="charts.js"></script>
+<script>
+// ---------- static text ----------
+const MODES = [
+  ["UOA + Mispricing", "Unusual activity + mispricing (both)",
+   "Runs both scans below and lists any contract that trips either one. A contract that trips both gets both signals."],
+  ["Unusual Activity", "Unusual activity (UOA)",
+   "UOA = Unusual Options Activity. Lists contracts where today's volume is large compared with open interest (positions already open at last close). Volume well above OI suggests new money arriving today, sometimes a big trader positioning ahead of news."],
+  ["Mispricing", "Mispricing (rich / cheap)",
+   "Prices each contract with Black-Scholes using the expiry's typical IV (the median IV of near-the-money contracts) and compares that with the market mid. Cheap = market below model; Rich = market above model. Only |delta| 0.2–0.8 is checked, to avoid far-out strikes where skew is normal."],
+  ["Tight Spreads", "Tight spreads (cheap to trade)",
+   "Lists liquid contracts whose bid-ask gap is small. A tight spread means you lose little to the market maker when you buy and later sell."],
+  ["Delta Bucket", "Delta bucket (group by payoff odds)",
+   "Lists every liquid contract in the chosen delta bucket (or all buckets). Useful to browse, for example, only long shots or only stock-like deep-in-the-money options."],
+];
+const BUCKETS = [
+  ["All", "All buckets"],
+  ["Lotto", "Lotto: long shot (|Δ| < 0.15)"],
+  ["Sensible", "Sensible: out of the money (0.15–0.35)"],
+  ["Directional", "Directional: near the money (0.35–0.65)"],
+  ["Deep ITM", "Deep ITM: stock-like (> 0.65)"],
+];
+const BUCKET_HELP = {
+  "Lotto": "Lotto (like a lottery ticket): |delta| below 0.15. Far out of the money, cheap, roughly under a 15% chance of finishing in the money. Usually expires worthless, but can pay many times its cost on a big move.",
+  "Sensible": "Sensible: |delta| 0.15–0.35. Out of the money but within reach; a balance of cost and odds.",
+  "Directional": "Directional: |delta| 0.35–0.65. Near the money; moves about half as much as the stock. The usual choice for a view on direction.",
+  "Deep ITM": "Deep ITM (in the money): |delta| above 0.65. Already worth a lot intrinsically and moves almost like the stock itself, with less time value to decay.",
+};
+const num = (d, sign) => v => v == null ? "" :
+  (sign && v > 0 ? "+" : "") + Number(v).toLocaleString("en-US", { minimumFractionDigits: d, maximumFractionDigits: d });
+// [key, heading, formatter, left-aligned, hover explanation]
+const COLS = [
+  ["type", "Type", v => v, true, "Call = right to buy at the strike (profits if price rises). Put = right to sell at the strike (profits if price falls)."],
+  ["expiry", "Expiry", v => v, true, "Date the option stops existing."],
+  ["dte", "DTE", num(0), false, "Days to expiry. Fewer days = faster time decay."],
+  ["strike", "Strike", num(2), false, "The price at which the option lets you buy (call) or sell (put)."],
+  ["bid", "Bid", num(2), false, "Highest price a buyer is offering right now (what you'd get if you sell)."],
+  ["ask", "Ask", num(2), false, "Lowest price a seller is asking right now (what you'd pay if you buy)."],
+  ["last", "Last", num(2), false, "Last traded price."],
+  ["mid", "Mid", num(2), false, "Halfway between bid and ask: a fair estimate of the price. Per share; 1 contract = 100 shares."],
+  ["volume", "Volume", num(0), false, "Contracts traded today."],
+  ["oi", "OI", num(0), false, "Open interest: contracts still open at the last close (positions held overnight)."],
+  ["vol_oi", "Vol/OI", num(1), false, "Volume ÷ open interest. Above 1 means more traded today than was open yesterday: unusual activity."],
+  ["iv", "IV %", v => v == null ? "" : num(1)(v * 100), false, "Implied volatility: how much movement per year the option price implies. Higher IV = pricier options."],
+  ["delta", "Delta", num(2, true), false, "Change in option price for a $1 move in the stock. Also a rough probability of finishing in the money."],
+  ["gamma", "Gamma", num(4), false, "Change in delta per $1 move in the underlying."],
+  ["theta", "Theta/day", num(3, true), false, "Time decay: how much the option loses per calendar day if nothing else changes (per share)."],
+  ["vega", "Vega", num(3), false, "How much the option gains if IV rises by 1 point (e.g. 20% → 21%), per share."],
+  ["ref_iv", "Ref IV %", v => v == null ? "" : num(1)(v * 100), false, "Expiry reference IV: median IV of |delta| 0.30–0.70 contracts. Theo is priced at this vol."],
+  ["theo", "Theo", num(2), false, "Model (Black-Scholes) price using this expiry's typical IV."],
+  ["edge_pct", "Edge %", num(1, true), false, "(Theo − Mid) ÷ Mid. Positive = cheaper than the model (Cheap). Negative = dearer (Rich)."],
+  ["spread_pct", "Spread %", num(1), false, "(Ask − Bid) ÷ Mid. The cost of trading; smaller is better."],
+  ["bucket", "Bucket", v => v, true, "Delta group: Lotto (< 0.15), Sensible (0.15–0.35), Directional (0.35–0.65), Deep ITM (> 0.65)."],
+  ["signal", "Signal", v => v, true, "Why this contract was listed. Click the row for the full working."],
+];
+// Pro view shows these extra columns; Beginner view hides them and uses friendlier headings.
+const PRO_ONLY = new Set(["last", "gamma", "ref_iv"]);
+const BEG_HEAD = {
+  type: "Call / Put", dte: "Days left", mid: "Price (mid)", volume: "Traded today", oi: "Open positions",
+  vol_oi: "Activity ratio", iv: "Implied vol %", delta: "Delta (odds)", theta: "Decay $/day",
+  vega: "IV sensitivity", theo: "Model price", edge_pct: "Cheap(+)/Rich(−) %", spread_pct: "Trading cost %",
+  bucket: "Group", signal: "Why listed",
+};
+const PRO_MODE = { "UOA + Mispricing": "UOA + Mispricing", "Unusual Activity": "UOA (Vol/OI)", "Mispricing": "Mispricing vs ref IV",
+                   "Tight Spreads": "Tight spreads", "Delta Bucket": "Delta bucket" };
+const PRO_BUCKET = { "All": "All", "Lotto": "Lotto |Δ|<0.15", "Sensible": "Sensible 0.15–0.35",
+                     "Directional": "Directional 0.35–0.65", "Deep ITM": "Deep ITM >0.65" };
+const plainSignal = s => s
+  .replace(/UOA ([\d.]+)x/g, "Unusual activity: $1× normal")
+  .replace(/Cheap vs ref IV \(\+(\d+)%\)/g, "Cheaper than model by $1%")
+  .replace(/Rich vs ref IV \(-(\d+)%\)/g, "Pricier than model by $1%")
+  .replace(/Tight spread ([\d.]+)%/g, "Cheap to trade (spread $1%)")
+  .replace(/Bucket: /g, "Group: ");
+let pro = false;
+try { pro = localStorage.getItem("scannerView") === "pro"; } catch (e) {}
+const visCols = () => COLS.filter(c => pro || !PRO_ONLY.has(c[0]));
+const GUIDE = [
+  ["Ticker", "Which stock or ETF.", "Every underlying has its own normal volatility: an index ETF moves less than a meme stock.",
+   "Sets the baseline: SPY IV is often 12–25%, a volatile single stock can be 50%+.",
+   "Higher-IV underlyings have bigger premiums, so they also lose more dollars per day to decay."],
+  ["Scan Type", "What you are hunting for.", "Activity (where is money flowing), value (rich or cheap), cost (spread) or risk profile (bucket).",
+   "Mispricing is purely an IV comparison: a contract's IV versus the typical IV of its expiry. Heavy buying (UOA) often pushes IV up.",
+   "Buyers of flagged contracts pay time decay every day; sellers collect it."],
+  ["Delta Bucket", "How far in or out of the money.", "Picks the payoff profile: cheap long shot vs. stock-like.",
+   "Higher IV widens the range of likely prices, pushing out-of-the-money deltas up toward 0.5; low IV pushes them toward 0 (more Lotto).",
+   "As expiry nears, out-of-the-money deltas collapse toward 0 and in-the-money deltas toward 1, so contracts drift into Lotto or Deep ITM. Lottos lose the largest share of their price to decay."],
+  ["Min DTE / Max DTE", "Which expiries to include.", "Short-dated = cheap and fast; long-dated = more time to be right.",
+   "Short-dated IV jumps around events (earnings, data releases); long-dated IV is steadier. Vega is larger for longer-dated options.",
+   "The core link. Time value shrinks roughly with the square root of time left, so decay speeds up near expiry: a 7-day option loses far more per day than a 60-day one. 0 DTE options lose all time value today."],
+  ["Min Volume", "Minimum trades today.", "Liquidity: you can get in and out near the quoted price.",
+   "IV from thinly traded contracts is often stale or wrong; filtering by volume keeps IVs trustworthy.",
+   "Indirect: with low volume you may not be able to exit before decay erodes the price."],
+  ["Min Open Interest", "Minimum open positions.", "Shows an established market in that contract.",
+   "Large OI at a strike means many traders hold exposure there; hedging flows can affect price and IV near it.",
+   "Indirect: OI often concentrates in near-term expiries where decay is fastest."],
+  ["UOA Vol/OI ≥", "How unusual today's activity must be.", "Spots fresh positioning that may hint at news or a big trader's view.",
+   "Strong buying demand bids option prices up, which shows up as rising IV.",
+   "New buyers start paying theta from day one; if it's short-dated, they need the move soon."],
+  ["Edge % ≥", "How far from the model price before flagging.", "Finds options priced unusually high or low relative to their expiry.",
+   "Edge is an IV gap expressed in price: a contract's IV above the expiry's typical IV shows as Rich, below as Cheap. (Edge ≈ IV gap × vega ÷ price.)",
+   "Short-dated options have small vega and small prices, so small IV gaps can show large edge %. Treat big edges near expiry with care."],
+  ["Max Spread %", "Widest acceptable bid-ask gap.", "The spread is a guaranteed cost on every round trip.",
+   "With a wide spread the mid is uncertain, so the IV and edge computed from it are unreliable.",
+   "If the daily decay is small compared with the spread, a short-term trade can lose money even if the view is right."],
+  ["Min Mid Price", "Ignore very cheap options.", "Penny options have huge % spreads and are hard to trade.",
+   "IV for a $0.02 option is very sensitive to a 1-cent change, so it is noisy.",
+   "On a tiny premium, one day's decay can be a large % of the price."],
+];
+const GLOSS = [
+  ["Option", "A contract giving the right, not the obligation, to buy (call) or sell (put) 100 shares at the strike before expiry."],
+  ["Premium / Mid", "The option's price per share. Multiply by 100 for one contract."],
+  ["Intrinsic value", "What the option would be worth if it expired now: call max(Spot − Strike, 0), put max(Strike − Spot, 0)."],
+  ["Time value", "Premium minus intrinsic value. It is the part that decays to zero by expiry."],
+  ["Implied volatility (IV)", "The yearly movement the option price implies. 20% IV ≈ the market expects about a ±20% move over a year (one standard deviation)."],
+  ["Realised volatility (RV)", "How much the price actually moved recently, annualised."],
+  ["Theta", "Time decay: value lost per day with everything else unchanged. Negative for option buyers."],
+  ["Vega", "Price change for a 1-point rise in IV."],
+  ["Delta", "Price change for a $1 stock move; also a rough chance of finishing in the money."],
+  ["Gamma", "How fast delta changes as the stock moves. Highest near the money and near expiry."],
+  ["UOA", "Unusual Options Activity: today's volume much larger than open interest."],
+  ["Skew", "Out-of-the-money puts usually have higher IV than calls, because investors pay up for crash protection."],
+  ["Lotto / Sensible / Directional / Deep ITM", "This scanner's delta groups. See the Delta Bucket row in the field guide."],
+];
+
+// ---------- maths (mirrors scanner_core.py) ----------
+function erf(x) { // Abramowitz-Stegun 7.1.26, error < 1.5e-7
+  const s = Math.sign(x); x = Math.abs(x);
+  const t = 1 / (1 + 0.3275911 * x);
+  return s * (1 - (((((1.061405429 * t - 1.453152027) * t) + 1.421413741) * t - 0.284496736) * t + 0.254829592) * t * Math.exp(-x * x));
+}
+const N = x => 0.5 * (1 + erf(x / Math.SQRT2));
+const npdf = x => Math.exp(-0.5 * x * x) / Math.sqrt(2 * Math.PI);
+function d12(S, K, T, r, q, s) {
+  const d1 = (Math.log(S / K) + (r - q + 0.5 * s * s) * T) / (s * Math.sqrt(T));
+  return [d1, d1 - s * Math.sqrt(T)];
+}
+
+// ---------- page ----------
+const $ = id => document.getElementById(id);
+const form = $("f");
+let marketDrawnFor = null;
+let rows = [], data = null, sortKey = null, sortDesc = true, selected = null;
+
+function applyView() {
+  document.body.classList.toggle("pro", pro);
+  $("viewTag").textContent = pro ? "Pro view" : "Beginner view";
+  $("viewBtn").textContent = pro ? "Switch to Beginner view" : "Switch to Pro view";
+  const mode = form.mode.value || MODES[0][0], bucket = form.bucket.value || "All";
+  form.mode.innerHTML = MODES.map(([v, t]) => `<option value="${v}">${esc(pro ? PRO_MODE[v] : t)}</option>`).join("");
+  form.bucket.innerHTML = BUCKETS.map(([v, t]) => `<option value="${v}">${esc(pro ? PRO_BUCKET[v] : t)}</option>`).join("");
+  form.mode.value = mode; form.bucket.value = bucket;
+  $("head").innerHTML = visCols().map(([k, h, , l, tip]) =>
+    `<th data-k="${k}" class="${l ? "l" : ""}" title="${esc(tip)}">${esc(pro ? h : BEG_HEAD[k] || h)}</th>`).join("");
+  if (data) renderSummary(data.ticker, data.summary);
+  if (selected) showWorking(selected);
+  render();
+}
+$("viewBtn").addEventListener("click", () => {
+  pro = !pro;
+  try { localStorage.setItem("scannerView", pro ? "pro" : "beginner"); } catch (e) {}
+  applyView();
+});
+$("guideBody").innerHTML = GUIDE.map(r => "<tr>" + r.map(c => `<td>${esc(c)}</td>`).join("") + "</tr>").join("");
+$("gloss").innerHTML = GLOSS.map(([t, d]) => `<dt>${esc(t)}</dt><dd>${esc(d)}</dd>`).join("");
+
+function esc(s) { return String(s).replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c])); }
+const f = (v, d = 2) => v == null || !isFinite(v) ? "n/a" : Number(v).toFixed(d);
+const pct = (v, d = 1) => v == null ? "n/a" : (v * 100).toFixed(d) + "%";
+
+function showModeHelp() {
+  const m = MODES.find(x => x[0] === form.mode.value);
+  const b = form.bucket.value;
+  $("modeHelp").textContent = m[2] + (m[0] === "Delta Bucket" && BUCKET_HELP[b] ? "  " + BUCKET_HELP[b] : "");
+}
+form.mode.addEventListener("change", showModeHelp);
+form.bucket.addEventListener("change", showModeHelp);
+
+function render() {
+  const cols = visCols();
+  $("body").innerHTML = rows.slice(0, 500).map((r, i) => `<tr data-i="${i}" class="${r === selected ? "sel" : ""}">` +
+    cols.map(([k, , fmt, l]) => {
+      let cls = l ? "l" : "";
+      if (k === "edge_pct" && r[k] != null) cls += r[k] > 0 ? " pos" : " neg";
+      const tip = k === "bucket" ? ` title="${esc(BUCKET_HELP[r[k]] || "")}"` : "";
+      const text = k === "signal" && !pro && r[k] ? plainSignal(r[k]) : fmt(r[k]);
+      return `<td class="${cls}"${tip}>${esc(text)}</td>`;
+    }).join("") + "</tr>").join("");
+  document.querySelectorAll("#grid th").forEach(th => {
+    const on = th.dataset.k === sortKey;
+    th.classList.toggle("sorted", on);
+    th.dataset.dir = on ? (sortDesc ? " ▼" : " ▲") : "";
+  });
+}
+
+$("head").addEventListener("click", e => {
+  const k = e.target.closest("th")?.dataset.k;
+  if (!k || !rows.length) return;
+  sortDesc = sortKey === k ? !sortDesc : true;
+  sortKey = k;
+  rows.sort((a, b) => {
+    const x = a[k], y = b[k];
+    if (x == null) return 1; if (y == null) return -1;
+    const c = x < y ? -1 : x > y ? 1 : 0;
+    return sortDesc ? -c : c;
+  });
+  render();
+});
+
+$("body").addEventListener("click", e => {
+  const tr = e.target.closest("tr");
+  if (!tr) return;
+  selected = rows[+tr.dataset.i];
+  render();
+  showWorking(selected);
+  $("workBox").scrollIntoView({ behavior: "smooth", block: "start" });
+});
+
+// ---------- summary cards with working ----------
+function renderSummary(t, s) {
+  const S = s.spot, cards = [];
+  cards.push(["Price (spot)", `$${f(S)}`, "Last traded price of the stock or ETF.", ""]);
+  if (s.atm_iv != null) {
+    const d = s.dte, T = Math.max(d, 0.5) / 365;
+    cards.push([`ATM IV (${d}-day expiry)`, pct(s.atm_iv),
+      `The implied volatility of the strike closest to the price, on the first expiry at least 7 days away. The market is pricing roughly a ±${pct(s.atm_iv, 0)} move over a full year.`,
+      `strike nearest $${f(S)} = $${f(s.atm_strike)}\nIV at that strike = ${pct(s.atm_iv, 2)}`]);
+    cards.push(["Expected move (1 sigma)", `±$${f(s.exp_move)}`,
+      `About a 2-in-3 chance the price ends between $${f(S - s.exp_move)} and $${f(S + s.exp_move)} by that expiry (if the model's assumptions hold).`,
+      `Spot × IV × √(days ÷ 365)\n= ${f(S)} × ${f(s.atm_iv, 4)} × √(${d} ÷ 365)\n= ${f(S)} × ${f(s.atm_iv, 4)} × ${f(Math.sqrt(T), 4)}\n= ±${f(s.exp_move)}`]);
+  }
+  if (s.skew_25d != null) {
+    cards.push(["25-delta skew", `${s.skew_25d > 0 ? "+" : ""}${f(s.skew_25d, 1)} vol pts`,
+      s.skew_25d > 0 ? "Downside protection (puts) costs more than upside bets (calls). Normal for indexes; a big number means fear."
+                     : "Calls are as pricey or pricier than puts: the market is leaning toward upside moves.",
+      `IV of put nearest −0.25 delta − IV of call nearest +0.25 delta\n= ${pct(s.p25_iv, 2)} (put $${f(s.p25_strike)}, Δ ${f(s.p25_delta)}) − ${pct(s.c25_iv, 2)} (call $${f(s.c25_strike)}, Δ ${f(s.c25_delta)})\n= ${f(s.skew_25d, 2)} points`]);
+  }
+  if (s.rv20 != null) {
+    cards.push(["Realised vol (20 days)", pct(s.rv20),
+      "How much the price actually moved over the last 20 trading days, scaled to a year so it compares with IV.",
+      `standard deviation of last 20 daily log returns × √252\n= ${f(s.rv20 / Math.sqrt(252), 5)} × ${f(Math.sqrt(252), 3)} = ${pct(s.rv20, 2)}`]);
+  }
+  if (s.iv_rv != null) {
+    cards.push(["IV ÷ RV", f(s.iv_rv),
+      s.iv_rv > 1 ? "Options are priced for more movement than has recently happened: option buyers pay up, and time decay tends to favour sellers."
+                  : "Options are priced for less movement than has recently happened: options look cheap versus recent moves, which favours buyers if that movement continues.",
+      `ATM IV ÷ RV = ${f(s.atm_iv, 4)} ÷ ${f(s.rv20, 4)} = ${f(s.iv_rv)}`]);
+  }
+  $("sumTicker").textContent = t;
+  $("cards").innerHTML = cards.map(([k, v, p, c]) =>
+    `<div class="card"><div class="k">${esc(k)}</div><div class="v">${esc(v)}</div><p>${esc(p)}</p>${c ? `<div class="calc">${esc(c)}</div>` : ""}</div>`).join("");
+  $("sumBox").hidden = false;
+  if (marketDrawnFor !== data) {  // keep the chosen chart expiry when only the view changes
+    marketDrawnFor = data;
+    try { ScanCharts.market($("marketCharts"), data); } catch (err) { console.error(err); $("marketCharts").textContent = ""; }
+  }
+}
+
+// ---------- per-contract working ----------
+function showWorking(r) {
+  const S = data.summary.spot, rr = data.r, q = data.q, cfg = data.config;
+  const isCall = r.type === "call", K = r.strike, s = r.iv;
+  const T = Math.max(r.dte, 0.5) / 365, sq = Math.sqrt(T);
+  const dq = Math.exp(-q * T), dr = Math.exp(-rr * T);
+  const [d1, d2] = d12(S, K, T, rr, q, s);
+  const steps = [];
+  const add = (title, calc, meaning) => steps.push([title, calc, meaning]);
+  const two = r.bid > 0 && r.ask > 0;
+
+  add("1. Mid price", two
+      ? `Mid = (Bid + Ask) ÷ 2\n= (${f(r.bid)} + ${f(r.ask)}) ÷ 2 = ${f(r.mid, 3)}`
+      : `No live bid and ask, so Mid = last traded price = ${f(r.last, 3)}`,
+    `A fair estimate of the price per share. One contract = 100 shares = $${f(r.mid * 100)}.` + (two ? "" : " Last trade may be stale, so treat everything below with caution."));
+
+  add("2. Spread %", two
+      ? `(Ask − Bid) ÷ Mid × 100\n= (${f(r.ask)} − ${f(r.bid)}) ÷ ${f(r.mid, 3)} × 100 = ${f(r.spread_pct, 1)}%`
+      : "Not available (no two-sided quote).",
+    "Roughly what you give up buying at the ask and later selling at the bid. Lower is cheaper to trade.");
+
+  const intr = Math.max(isCall ? S - K : K - S, 0);
+  add("3. Intrinsic vs time value", `Intrinsic = max(${isCall ? "Spot − Strike" : "Strike − Spot"}, 0)\n= max(${isCall ? `${f(S)} − ${f(K)}` : `${f(K)} − ${f(S)}`}, 0) = ${f(intr)}\nTime value = Mid − Intrinsic = ${f(r.mid, 3)} − ${f(intr)} = ${f(r.mid - intr, 3)}`,
+    `${f(Math.max(r.mid - intr, 0) / r.mid * 100, 0)}% of this price is time value. That part shrinks to zero by expiry; theta (step 8) is its daily rate of decay.`);
+
+  add("4. Volume ÷ open interest", r.oi > 0
+      ? `${num(0)(r.volume)} ÷ ${num(0)(r.oi)} = ${f(r.vol_oi, 2)}×`
+      : "Open interest is 0, so the ratio is undefined.",
+    r.vol_oi >= 1 ? "More contracts traded today than were open at last close: likely new positions, which is what makes it 'unusual'."
+                  : "Today's trading is smaller than existing positions: normal activity.");
+
+  add("5. Time to expiry in years", `T = max(DTE, 0.5) ÷ 365 = ${Math.max(r.dte, 0.5)} ÷ 365 = ${f(T, 5)}`,
+    "The model works in years. Options expiring today are given half a day so the maths stays defined.");
+
+  add("6. d1 and d2 (Black-Scholes inputs)",
+    `σ = this contract's IV = ${f(s, 4)}, r = ${f(rr, 3)}, q = ${f(q, 3)}\n` +
+    `d1 = [ln(S/K) + (r − q + σ²/2)·T] ÷ (σ·√T)\n= [ln(${f(S)}/${f(K)}) + (${f(rr, 3)} − ${f(q, 3)} + ${f(s * s / 2, 4)})·${f(T, 5)}] ÷ (${f(s, 4)}·${f(sq, 4)})\n= [${f(Math.log(S / K), 4)} + ${f((rr - q + s * s / 2) * T, 5)}] ÷ ${f(s * sq, 4)} = ${f(d1, 4)}\n` +
+    `d2 = d1 − σ·√T = ${f(d1, 4)} − ${f(s * sq, 4)} = ${f(d2, 4)}`,
+    "d1 and d2 measure, in standard deviations, how far the strike is from the price after allowing for volatility and time. The bigger σ·√T, the more 'reachable' a far strike becomes.");
+
+  add("7. Delta and bucket", (isCall ? `Delta = e^(−qT) × N(d1) = ${f(dq, 4)} × ${f(N(d1), 4)}` : `Delta = e^(−qT) × (N(d1) − 1) = ${f(dq, 4)} × (${f(N(d1), 4)} − 1)`) +
+    ` = ${f(r.delta, 3)}\n|Δ| = ${f(Math.abs(r.delta), 3)} → ` +
+    (Math.abs(r.delta) < 0.15 ? "below 0.15 → Lotto" : Math.abs(r.delta) < 0.35 ? "0.15 to 0.35 → Sensible" : Math.abs(r.delta) < 0.65 ? "0.35 to 0.65 → Directional" : "above 0.65 → Deep ITM"),
+    `N() is the normal-curve probability. A $1 move in the stock changes this option by about $${f(Math.abs(r.delta))}, and it has very roughly a ${f(Math.abs(r.delta) * 100, 0)}% chance of finishing in the money. ${BUCKET_HELP[r.bucket] || ""}`);
+
+  const decay = -S * dq * npdf(d1) * s / (2 * sq);
+  const carry = isCall ? -rr * K * dr * N(d2) + q * S * dq * N(d1) : rr * K * dr * N(-d2) - q * S * dq * N(-d1);
+  add("8. Theta (time decay per day)",
+    `Volatility part = −S·e^(−qT)·n(d1)·σ ÷ (2√T)\n= −${f(S)} × ${f(dq, 4)} × ${f(npdf(d1), 4)} × ${f(s, 4)} ÷ (2 × ${f(sq, 4)}) = ${f(decay, 3)} per year\n` +
+    `Interest part = ${f(carry, 3)} per year\nTheta per day = (${f(decay, 3)} + ${f(carry, 3)}) ÷ 365 = ${f(r.theta, 4)}`,
+    `With price and IV unchanged, this option loses about $${f(Math.abs(r.theta), 3)} per share a day ($${f(Math.abs(r.theta) * 100)} per contract), which is ${f(Math.abs(r.theta) / r.mid * 100, 1)}% of its price. Note σ and √T: higher IV means more to decay, and dividing by √T makes decay speed up as expiry approaches.`);
+
+  add("9. Vega (sensitivity to IV)",
+    `Vega = S·e^(−qT)·n(d1)·√T ÷ 100\n= ${f(S)} × ${f(dq, 4)} × ${f(npdf(d1), 4)} × ${f(sq, 4)} ÷ 100 = ${f(r.vega, 4)}`,
+    `If IV rises 1 point (e.g. ${pct(s)} → ${pct(s + 0.01)}), the option gains about $${f(r.vega, 3)} per share. Vega grows with √T, so longer-dated options care more about IV; short-dated ones care more about time decay.`);
+
+  if (r.ref_iv == null) {
+    add("10. Reference IV, theo and edge", "No contracts in this expiry had |delta| between 0.30 and 0.70, so there is no reference IV.",
+      "Theo and Edge % are left blank. This usually happens when quotes are missing (market closed).");
+  } else {
+    const [e1, e2] = d12(S, K, T, rr, q, r.ref_iv);
+    const gap = (s - r.ref_iv) * 100;
+    add("10. Reference IV for this expiry", `Median IV of ${r.expiry} contracts with |Δ| 0.30–0.70 = ${pct(r.ref_iv, 2)}\nThis contract's IV = ${pct(s, 2)} → ${gap >= 0 ? "+" : ""}${f(gap, 1)} vol points vs reference`,
+      "The 'normal' volatility level for this expiry. A contract whose own IV is above it is priced richly, below it cheaply.");
+    add("11. Theoretical price (at reference IV)",
+      `d1 = ${f(e1, 4)}, d2 = ${f(e2, 4)} (step 6 with σ = ${f(r.ref_iv, 4)})\n` +
+      (isCall ? `Theo = S·e^(−qT)·N(d1) − K·e^(−rT)·N(d2)\n= ${f(S)} × ${f(dq, 4)} × ${f(N(e1), 4)} − ${f(K)} × ${f(dr, 4)} × ${f(N(e2), 4)}`
+              : `Theo = K·e^(−rT)·N(−d2) − S·e^(−qT)·N(−d1)\n= ${f(K)} × ${f(dr, 4)} × ${f(N(-e2), 4)} − ${f(S)} × ${f(dq, 4)} × ${f(N(-e1), 4)}`) +
+      ` = ${f(r.theo, 3)}`,
+      "What Black-Scholes says this option is worth if it carried the expiry's normal IV.");
+    add("12. Edge %", `(Theo − Mid) ÷ Mid × 100\n= (${f(r.theo, 3)} − ${f(r.mid, 3)}) ÷ ${f(r.mid, 3)} × 100 = ${r.edge_pct > 0 ? "+" : ""}${f(r.edge_pct, 1)}%`,
+      (r.edge_pct > 0 ? "Positive: the market price is below the model, so it is 'Cheap' versus normal IV." : "Negative: the market price is above the model, so it is 'Rich' versus normal IV.") +
+      " Rough check: edge ≈ IV gap × vega ÷ mid. Edges in the hundreds or thousands of % usually mean a bad or stale quote, not a bargain.");
+  }
+
+  // why it was listed
+  const tick = ok => ok ? "✓" : "✗";
+  const lines = [`Liquidity filter: volume ${num(0)(r.volume)} ≥ ${cfg.min_volume} ${tick(r.volume >= cfg.min_volume)}, OI ${num(0)(r.oi)} ≥ ${cfg.min_oi} ${tick(r.oi >= cfg.min_oi)}`];
+  const m = cfg.mode;
+  if (m.includes("UOA") || m === "Unusual Activity")
+    lines.push(`UOA: Vol/OI ${f(r.vol_oi, 2)} ≥ ${cfg.uoa_ratio} ${tick(r.vol_oi >= cfg.uoa_ratio)}`);
+  if (m.includes("Mispricing"))
+    lines.push(`Mispricing: |Δ| ${f(Math.abs(r.delta))} in 0.2–0.8 ${tick(Math.abs(r.delta) >= 0.2 && Math.abs(r.delta) <= 0.8)}, mid ${f(r.mid)} ≥ ${cfg.min_price} ${tick(r.mid >= cfg.min_price)}, spread ${r.spread_pct == null ? "n/a" : f(r.spread_pct, 1) + "%"} ≤ ${cfg.max_spread_pct}% ${tick(r.spread_pct != null && r.spread_pct <= cfg.max_spread_pct)}, |edge| ${r.edge_pct == null ? "n/a" : f(Math.abs(r.edge_pct), 1) + "%"} ≥ ${cfg.edge_pct}% ${tick(r.edge_pct != null && Math.abs(r.edge_pct) >= cfg.edge_pct)}`);
+  if (m === "Tight Spreads")
+    lines.push(`Tight spread: spread ${f(r.spread_pct, 1)}% ≤ ${cfg.max_spread_pct}% ✓, mid ${f(r.mid)} ≥ ${cfg.min_price} ✓`);
+  if (m === "Delta Bucket")
+    lines.push(`Bucket: ${r.bucket}${cfg.bucket === "All" ? " (all buckets shown)" : ` = ${cfg.bucket} ✓`}, mid ${f(r.mid)} ≥ ${cfg.min_price} ✓`);
+  add(`${steps.length + 1}. Why it was listed`, lines.join("\n") + `\nSignal: ${r.signal}`,
+    m === "UOA + Mispricing" ? "In the combined scan a contract needs to pass only one of the two tests (✓ on every item of that line)." : "Each listed contract passes every check on its scan's line.");
+
+  $("workTitle").textContent = `How the numbers were worked out: ${data.ticker} ${r.expiry} $${f(K)} ${r.type}`;
+  $("workHint").textContent = `Spot S = ${f(S)}, strike K = ${f(K)}, risk-free rate r = ${pct(rr)}, dividend yield q = ${pct(q)}. Small differences in the last decimal come from rounding.`;
+  $("steps").innerHTML = steps.map(([t, c, p]) =>
+    `<div class="step"><h3>${esc(t)}</h3><div class="calc">${esc(c)}</div><p>${esc(p)}</p></div>`).join("");
+  try { ScanCharts.contract($("contractCharts"), data, r); } catch (err) { console.error(err); $("contractCharts").textContent = ""; }
+}
+
+// Turn the API's validation errors into "Min Volume: ..." messages.
+const FIELD_LABEL = { ticker: "Ticker", min_dte: "Min DTE", max_dte: "Max DTE", min_volume: "Min Volume", min_oi: "Min Open Interest",
+  uoa_ratio: "UOA Vol/OI", edge_pct: "Edge %", max_spread_pct: "Max Spread %", min_price: "Min Mid Price", mode: "Scan Type", bucket: "Delta Bucket" };
+function fieldError(e) {
+  const f = (e.loc || []).slice(-1)[0];
+  const what = e.type === "int_parsing" ? "enter a whole number" : e.type === "float_parsing" ? "enter a number"
+    : e.type === "greater_than_equal" ? `must be at least ${e.ctx?.ge}` : e.type === "less_than_equal" ? `must be at most ${e.ctx?.le}`
+    : e.type === "string_too_long" ? "is too long" : e.type === "string_too_short" ? "is required" : e.msg;
+  return `${FIELD_LABEL[f] || f}: ${what}.`;
+}
+function setStatus(msg, err) { $("status").textContent = msg; $("status").classList.toggle("err", !!err); }
+
+form.addEventListener("submit", async e => {
+  e.preventDefault();
+  const params = new URLSearchParams(new FormData(form));
+  params.set("ticker", params.get("ticker").trim().toUpperCase());
+  if (!/^\^?[A-Z0-9][A-Z0-9.\-=]{0,11}$/.test(params.get("ticker")))
+    return setStatus("Please enter a ticker symbol such as SPY, AAPL, BRK-B or ^SPX (letters, digits, '.', '-', '^' or '=' only).", true);
+  if (+params.get("min_dte") > +params.get("max_dte")) return setStatus("Min DTE must not exceed Max DTE.", true);
+  $("scan").disabled = true;
+  setStatus(`Fetching option chains for ${params.get("ticker")}...`);
+  try {
+    const res = await fetch("/api/scan?" + params);
+    const d = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      const x = d.detail;
+      throw new Error(typeof x === "string" ? x : Array.isArray(x) ? x.map(fieldError).join(" ") : `Request failed (${res.status}).`);
+    }
+    data = d; rows = d.rows; sortKey = null; selected = null;
+    renderSummary(d.ticker, d.summary);
+    const stale = d.contracts && d.two_sided / d.contracts < 0.5;
+    $("warn").hidden = !stale;
+    $("warn").textContent = stale
+      ? `Warning: only ${d.two_sided} of ${d.contracts} contracts have a live bid and ask, so the US market is probably closed. ` +
+        "Yahoo then reports placeholder IVs, which push most deltas toward 0 (so most rows land in Lotto) and make IV, theo and edge unreliable. " +
+        "Scan during US market hours (9:30am–4pm New York time) for meaningful numbers."
+      : "";
+    $("workBox").hidden = false;
+    $("workTitle").textContent = "How the numbers were worked out";
+    $("workHint").textContent = rows.length ? "Click any row in the results table to see its working here." : "No contracts matched. Try loosening the filters.";
+    $("steps").innerHTML = "";
+    $("contractCharts").textContent = "";
+    render();
+    $("export").disabled = !rows.length;
+    const sm = d.summary, partial = sm.expiries_in_window > sm.expiries_scanned;
+    setStatus(`${rows.length} signals from ${d.contracts} contracts across ${sm.expiries_scanned ?? d.expiries.length} expiries` +
+      (partial ? ` (a spread of ${sm.expiries_scanned} of the ${sm.expiries_in_window} in your DTE window)` : "") +
+      `, showing ${Math.min(rows.length, 500)}` + (d.cached ? ", cached chain." : "."));
+  } catch (err) {
+    setStatus("Scan failed: " + err.message, true);
+  } finally {
+    $("scan").disabled = false;
+  }
+});
+
+$("export").addEventListener("click", () => {
+  const q = v => v == null ? "" : /[",\n]/.test(String(v)) ? `"${String(v).replace(/"/g, '""')}"` : String(v);
+  const keys = Object.keys(rows[0]);
+  const csv = [keys.join(","), ...rows.map(r => keys.map(k => q(r[k])).join(","))].join("\n");
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(new Blob([csv], { type: "text/csv" }));
+  a.download = `${data.ticker}_scanner_${new Date().toISOString().slice(0, 10).replace(/-/g, "")}.csv`;
+  a.click();
+  URL.revokeObjectURL(a.href);
+});
+
+// ---------- Sunny / Dark theme ----------
+function currentTheme() {
+  return document.documentElement.dataset.theme ||
+    (window.matchMedia && matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light");
+}
+function showThemeBtn() {
+  // The button names the theme it switches TO.
+  $("themeBtn").textContent = currentTheme() === "dark" ? "☀️ Sunny" : "🌙 Dark";
+}
+$("themeBtn").addEventListener("click", () => {
+  const next = currentTheme() === "dark" ? "light" : "dark";
+  document.documentElement.dataset.theme = next;
+  try { localStorage.setItem("scannerTheme", next); } catch (e) {}
+  showThemeBtn();
+});
+showThemeBtn();
+
+applyView();
+showModeHelp();
+</script>
+</body>
+</html>
