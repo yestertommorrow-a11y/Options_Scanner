@@ -82,8 +82,9 @@ Note: Yahoo sometimes rate-limits requests from cloud servers, so test the deplo
 ## Tests
 
 ```bash
-.venv\Scripts\python tests\test_scanner.py
-.venv\Scripts\python tests\simulate_api.py      # needs the server running
+.venv\Scripts\python -B tests\test_scanner.py   # offline: maths, scan rules, regression cases, Tkinter tab
+.venv\Scripts\python -B tests\test_api.py       # offline: API statuses, field errors, exact rows (Yahoo stubbed)
+.venv\Scripts\python tests\simulate_api.py      # live smoke test; needs the server running; exits 1 on any mismatch
 ```
 
 ## Limitations
@@ -92,4 +93,6 @@ Note: Yahoo sometimes rate-limits requests from cloud servers, so test the deplo
 - "Rich" and "Cheap" mean out of line with the fitted smile at that strike, i.e. versus neighbouring options, not versus a fair value. A quadratic smile can misfit far wings, so treat wing signals with care.
 - Prices use the underlying price implied by the option quotes (put-call parity), because Yahoo's stock quote can be stale, e.g. the previous close outside US hours. The page warns when the two differ.
 - IV is solved from each strike's out-of-the-money mid price and shared with the in-the-money option at that strike (US options are American, so in-the-money prices carry early-exercise value). Without a live quote, Yahoo's IV is used.
+- A quote is "live" only if bid and ask are positive and ask ≥ bid. Crossed or missing quotes fall back to the last trade, never pass Tight Spreads and never move the implied price or the smile.
+- Rich/Cheap needs a live out-of-the-money quote whose IV was solved from that quote, and a smile with support at the strike: each contract is judged against a fit without itself, after outliers are screened out, and only inside the range of strikes that fit covers. Otherwise the verdict is withheld and the worked example says why.
 - Up to 12 expiries per scan, spread across the chosen DTE window.

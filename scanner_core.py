@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import math
 import os
+import re
 from dataclasses import dataclass
 
 import numpy as np
@@ -24,6 +25,12 @@ RISK_FREE_RATE = float(os.environ.get("RISK_FREE_RATE", "0.045"))
 DIVIDEND_YIELD = float(os.environ.get("DIVIDEND_YIELD", "0.0"))
 
 BUCKETS = ["Lotto", "Sensible", "Directional", "Deep ITM"]
+MAX_DTE = 730
+# One symbol rule for every client: after trimming and upper-casing, 1-12 characters in total
+# (a leading ^ counts), letters/digits first, then letters, digits, '.', '-' or '='.
+TICKER_RE = re.compile(r"(?=.{1,12}$)\^?[A-Z0-9][A-Z0-9.\-=]*")
+TICKER_HELP = ("Please enter a ticker symbol such as SPY, AAPL, BRK-B or ^SPX "
+               "(up to 12 characters: letters, digits, '.', '-', '^' or '=').")
 MODES = [
     "UOA + Mispricing",
     "Unusual Activity",
@@ -31,6 +38,43 @@ MODES = [
     "Tight Spreads",
     "Delta Bucket",
 ]
+
+
+def normalize_ticker(raw) -> str:
+    """Trim and upper-case a symbol; raise ValueError(TICKER_HELP) if it is not a valid symbol.
+
+    Yahoo silently ignores junk such as "SPY;X" and returns SPY, which would put SPY data
+    under the wrong name, so anything outside the symbol alphabet is rejected up front.
+    """
+    t = str(raw or "").strip().upper()
+    if not TICKER_RE.fullmatch(t):
+        raise ValueError(TICKER_HELP)
+    return t
+
+
+def validate_settings(min_dte, max_dte, cfg: "ScanConfig") -> None:
+    """Field-by-field checks shared by the web API and the desktop tab. Raises ValueError."""
+    def num(label, v, integer=False):
+        if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v):
+            raise ValueError(f"{label}: enter a finite number.")
+        if integer and v != int(v):
+            raise ValueError(f"{label}: enter a whole number.")
+        if v < 0:
+            raise ValueError(f"{label}: must be at least 0.")
+    num("Min DTE", min_dte, True)
+    num("Max DTE", max_dte, True)
+    if max_dte > MAX_DTE:
+        raise ValueError(f"Max DTE: must be at most {MAX_DTE}.")
+    if min_dte > max_dte:
+        raise ValueError("Min DTE must not exceed Max DTE.")
+    num("Min Volume", cfg.min_volume, True)
+    num("Min Open Interest", cfg.min_oi, True)
+    num("UOA Vol/OI", cfg.uoa_ratio)
+    num("Edge %", cfg.edge_pct)
+    num("Max Spread %", cfg.max_spread_pct)
+    num("Min Mid Price", cfg.min_price)
+    if cfg.bucket != "All" and cfg.bucket not in BUCKETS:
+        raise ValueError(f"Unknown delta bucket '{cfg.bucket}'.")
 
 
 # --------------------------------------------------------------------------
@@ -127,15 +171,22 @@ def pick_expiries(expiries: list, max_expiries: int) -> list:
     silently stop the scan a week or two out even when Max DTE is 45. Keep the two
     nearest (most active) and spread the rest evenly to the far end of the window.
     """
+    if max_expiries < 1:
+        raise ValueError("max_expiries must be at least 1.")
     if len(expiries) <= max_expiries:
         return list(expiries)
+    if max_expiries == 1:
+        return [expiries[0]]  # one slot: the nearest, most active expiry
     # Space by calendar date, not list position: near-term dates are daily, later ones
     # weekly or monthly, so spacing by position would bunch the picks near the start.
+    # With 2+ slots the farthest expiry is always included, so the whole window is covered.
     days = np.array([pd.Timestamp(e).value for e in expiries], dtype=float) if isinstance(expiries[0], str) \
         else np.asarray(expiries, dtype=float)
-    head = 2
+    head = min(2, max_expiries - 1)
     keep = set(range(head))
-    for target in np.linspace(days[head], days[-1], max_expiries - head):
+    slots = max_expiries - head
+    targets = [days[-1]] if slots == 1 else np.linspace(days[head], days[-1], slots)
+    for target in targets:
         free = [i for i in range(head, len(days)) if i not in keep]
         keep.add(min(free, key=lambda i: abs(days[i] - target)))
     return [expiries[i] for i in sorted(keep)]
@@ -166,19 +217,32 @@ def fetch_chain(ticker: str, min_dte: int, max_dte: int, max_expiries: int = 12)
         raise ValueError(f"No expiries for '{ticker}' between {min_dte} and {max_dte} DTE.")
     expiries = pick_expiries(in_window, max_expiries)
 
-    frames = []
+    # Yahoo sometimes returns nothing (or None) for one expiry or one side of it. Keep what
+    # did arrive and report the real coverage instead of failing the whole scan.
+    frames, got, missing = [], [], []
     for exp in expiries:
-        oc = t.option_chain(exp)
-        for kind, frame in (("call", oc.calls), ("put", oc.puts)):
-            f = frame.copy()
-            f["type"] = kind
-            f["expiry"] = exp
-            frames.append(f)
+        try:
+            oc = t.option_chain(exp)
+        except Exception:
+            oc = None
+        legs = 0
+        for kind in ("call", "put"):
+            frame = getattr(oc, kind + "s", None) if oc is not None else None
+            if isinstance(frame, pd.DataFrame) and not frame.empty:
+                f = frame.copy()
+                f["type"] = kind
+                f["expiry"] = exp
+                frames.append(f)
+                legs += 1
+        (got if legs else missing).append(exp)
+    if not frames:
+        raise ValueError(f"Yahoo returned no option data for '{ticker}' between {min_dte} and {max_dte} DTE.")
     raw = pd.concat(frames, ignore_index=True)
 
     chain = prepare_chain(raw, spot, today)
     summary = summarize(chain, spot, hist["Close"])
-    summary["expiries_scanned"], summary["expiries_in_window"] = len(expiries), len(in_window)
+    summary["expiries_scanned"], summary["expiries_in_window"] = len(got), len(in_window)
+    summary["expiries_missing"] = missing
     return spot, chain, summary
 
 
@@ -195,7 +259,7 @@ def parity_spot(df: pd.DataFrame, spot: float, r: float, q: float) -> pd.Series:
     spot when an expiry has no two-sided call/put pair or the estimate is more than 10% away.
     """
     out = pd.Series(float(spot), index=df.index)
-    live = df[(df["bid"] > 0) & (df["ask"] > 0)]
+    live = df[df["quote"] == "live"]  # crossed or missing quotes never move the spot
     for exp, g in live.groupby("expiry"):
         T = max(float(g["dte"].iloc[0]), 0.5) / 365.0
         c = g[g["type"] == "call"].groupby("strike")["mid"].mean()
@@ -211,26 +275,84 @@ def parity_spot(df: pd.DataFrame, spot: float, r: float, q: float) -> pd.Series:
     return out
 
 
-def fit_smile(e: pd.DataFrame, min_points: int = 6):
+SMILE_MIN_STRIKES = 6
+
+
+def smile_points(e: pd.DataFrame) -> pd.DataFrame:
+    """Rows of one expiry that may shape its smile: out-of-the-money, live quote, IV solved
+    from that quote, |delta| 0.05-0.95 and a spread of at most 25%."""
+    return e[e["otm"] & (e["quote"] == "live") & (e["iv_source"] == "mid")
+             & e["delta"].abs().between(0.05, 0.95) & (e["spread_pct"] <= 25)]
+
+
+OUTLIER_FLOOR = 0.005  # 0.5 vol point: residuals smaller than this are never called outliers
+
+
+def _fit(k, iv, w, strikes, min_strikes=SMILE_MIN_STRIKES):
+    """Vega-weighted quadratic IV(k). Returns (coef, k_min, k_max) of the points used, or None
+    if fewer than min_strikes distinct strikes support it (the verdict is then withheld)."""
+    if len(k) == 0 or len(np.unique(strikes)) < min_strikes:
+        return None
+    coef = np.polyfit(k, iv, 2, w=w)
+    return coef, float(k.min()), float(k.max())
+
+
+def smile_inliers(k, iv, w, strikes, max_out=3):
+    """Outlier screen, run once per expiry before any reference is built.
+
+    Drop each point in turn and keep the drop that leaves the cleanest fit (smallest weighted
+    RMS of the rest). If that point sits far off the clean curve (more than 4x the remaining
+    scatter and more than 0.5 vol point), it is an outlier: remove it from every fit and repeat,
+    up to max_out times while enough strikes remain. With few points a plain residual test fails,
+    because every fit that contains the outlier is bent by it.
+    """
+    n = len(k)
+    keep = np.ones(n, dtype=bool)
+    for _ in range(max_out):
+        idx = np.flatnonzero(keep)
+        if len(np.unique(strikes[idx])) <= SMILE_MIN_STRIKES:
+            break  # dropping one more would leave too little support to judge anything
+        best = None
+        for j in idx:
+            m = keep.copy()
+            m[j] = False
+            res = _fit(k[m], iv[m], w[m], strikes[m], min_strikes=3)
+            if res is None:
+                continue
+            fitted = np.polyval(res[0], k[m])
+            rms = math.sqrt(np.average((iv[m] - fitted) ** 2, weights=w[m] ** 2))
+            r_j = abs(iv[j] - np.polyval(res[0], k[j]))
+            if best is None or rms < best[0]:
+                best = (rms, j, r_j)
+        if best is None:
+            break
+        rms, j, r_j = best
+        if r_j > max(4 * rms, OUTLIER_FLOOR):
+            keep[j] = False
+        else:
+            break
+    return keep
+
+
+def fit_smile(e: pd.DataFrame, exclude=None):
     """Quadratic smile IV(k), k = ln(K/S), through one expiry's out-of-the-money live IVs.
 
-    Weighted by vega so liquid near-the-money points count most; one refit drops points more
-    than 3 robust standard deviations off the curve, so a single bad quote cannot bend it.
-    Returns polynomial coefficients for np.polyval, or None if there are too few points.
+    Outliers found by smile_inliers() are removed first. exclude: an index label to leave out,
+    so a contract never helps build its own reference (an overpriced option would otherwise drag
+    the curve toward itself and push its fairly priced neighbours off it).
+    Returns (coef, k_min, k_max) or None without enough support. prepare_chain uses the same steps.
     """
-    pts = e[e["otm"] & (e["iv_source"] == "mid") & e["delta"].abs().between(0.05, 0.95)
-            & (e["spread_pct"] <= 25)]
-    if len(pts) < min_points:
+    pts = smile_points(e)
+    if pts.empty:
         return None
-    k, iv = pts["moneyness"].to_numpy(), pts["iv"].to_numpy()
     w = np.sqrt(np.maximum(pts["vega"].to_numpy(), 1e-8))
-    coef = np.polyfit(k, iv, 2, w=w)
-    resid = iv - np.polyval(coef, k)
-    mad = np.median(np.abs(resid - np.median(resid))) * 1.4826
-    keep = np.abs(resid) <= 3 * max(mad, 1e-4)
-    if keep.sum() >= min_points and not keep.all():
-        coef = np.polyfit(k[keep], iv[keep], 2, w=w[keep])
-    return coef
+    pts = pts[smile_inliers(pts["moneyness"].to_numpy(), pts["iv"].to_numpy(), w, pts["strike"].to_numpy())]
+    if exclude is not None:
+        pts = pts.drop(index=exclude, errors="ignore")
+    if pts.empty:
+        return None
+    return _fit(pts["moneyness"].to_numpy(), pts["iv"].to_numpy(),
+                np.sqrt(np.maximum(pts["vega"].to_numpy(), 1e-8)), pts["strike"].to_numpy())
 
 
 def prepare_chain(raw: pd.DataFrame, spot: float, today=None,
@@ -249,10 +371,19 @@ def prepare_chain(raw: pd.DataFrame, spot: float, today=None,
     if df.empty:
         return df.reset_index(drop=True)
 
-    two_sided = (df["bid"] > 0) & (df["ask"] > 0)
-    df["mid"] = np.where(two_sided, (df["bid"] + df["ask"]) / 2.0, df["last"])
+    # One quote rule for everything quote-driven (spread, parity spot, IV, smile, Rich/Cheap):
+    # "live" = finite bid and ask, both > 0, ask >= bid (a locked quote, ask == bid, is fine).
+    # A crossed quote (bid > ask) is not a market; it falls back to the last trade like a
+    # missing quote, so it can never pass Tight Spreads or move the implied spot.
+    bid, ask = df["bid"].to_numpy(dtype=float), df["ask"].to_numpy(dtype=float)
+    with np.errstate(invalid="ignore"):
+        priced = np.isfinite(bid) & np.isfinite(ask) & (bid > 0) & (ask > 0)
+        two_sided = priced & (ask >= bid)
+        crossed = priced & (ask < bid)
+    df["quote"] = np.select([two_sided, crossed], ["live", "crossed"], default="none")
+    df["mid"] = np.where(two_sided, (bid + ask) / 2.0, df["last"])
     with np.errstate(all="ignore"):
-        df["spread_pct"] = np.where(two_sided, (df["ask"] - df["bid"]) / df["mid"] * 100.0, np.nan)
+        df["spread_pct"] = np.where(two_sided, (ask - bid) / df["mid"] * 100.0, np.nan)
         df["vol_oi"] = np.where(df["oi"] > 0, df["volume"] / df["oi"], np.nan)
 
     # IV per strike, taken from the OUT-of-the-money option's live mid and shared with the
@@ -271,8 +402,12 @@ def prepare_chain(raw: pd.DataFrame, spot: float, today=None,
     own = implied_vol(np.where(two_sided, df["mid"], np.nan), S, df["strike"], T, r, q, is_call)
     pair = (pd.Series(np.where(otm, own, np.nan), index=df.index)
             .groupby([df["expiry"], df["strike"]]).transform("mean").to_numpy())
-    src = np.select([otm & np.isfinite(own), ~otm & np.isfinite(pair), np.isfinite(own)],
-                    ["mid", "pair", "mid"], default="yahoo")
+    # Provenance: mid = solved from this quote; pair = from the OTM option at this strike;
+    # rejected = live quote whose mid no volatility can produce (e.g. $150 for a $5 option);
+    # crossed = bid above ask; yahoo = no usable quote. Only "mid" can be judged Rich/Cheap.
+    src = np.select([otm & np.isfinite(own), ~otm & np.isfinite(pair), np.isfinite(own),
+                     two_sided, crossed],
+                    ["mid", "pair", "mid", "rejected", "crossed"], default="yahoo")
     df["iv_source"] = src
     df["iv"] = np.select([src == "pair", src == "mid"], [pair, own], default=df["iv_yahoo"])
     # yfinance returns near-zero or huge IVs for dead contracts; drop them.
@@ -284,19 +419,44 @@ def prepare_chain(raw: pd.DataFrame, spot: float, today=None,
     df["delta"], df["gamma"] = delta, gamma
     df["theta"], df["vega"] = bs_theta_vega(S, df["strike"], T, r, q, df["iv"], is_call)
 
-    # Reference IV = the expiry's smile, fitted through its out-of-the-money live IVs and read at this
-    # contract's own strike. Comparing with one at-the-money level instead flags every far call
-    # "Cheap" and every far put "Rich", because IV slopes along the curve (skew). Without enough
-    # points to fit, fall back to the median IV of near-the-money calls (or puts).
+    # Reference IV = the expiry's smile, fitted through its out-of-the-money live IVs and read at
+    # this contract's own strike. Comparing with one at-the-money level instead flags every far
+    # call "Cheap" and every far put "Rich", because IV slopes along the curve (skew).
+    # A contract that helps shape the smile is judged against a fit WITHOUT itself, and only
+    # inside the strike range the remaining points cover (no extrapolation to the wings).
     k = np.log(df["strike"].to_numpy() / S)
     df["moneyness"] = k
-    df["ref_iv"] = np.nan
-    df["ref_method"] = ""
-    for exp, idx in df.groupby("expiry").groups.items():
-        fit = fit_smile(df.loc[idx])
-        if fit is not None:
-            df.loc[idx, "ref_iv"] = np.clip(np.polyval(fit, df.loc[idx, "moneyness"]), 0.01, 5.0)
-            df.loc[idx, "ref_method"] = "smile"
+    ref = np.full(len(df), np.nan)
+    supported = np.zeros(len(df), dtype=bool)
+    method = np.full(len(df), "", dtype=object)
+    pos = {label: i for i, label in enumerate(df.index)}
+    for _, idx in df.groupby("expiry").groups.items():
+        e = df.loc[idx]
+        pts = smile_points(e)
+        pk, piv = pts["moneyness"].to_numpy(), pts["iv"].to_numpy()
+        pw, pstrike = np.sqrt(np.maximum(pts["vega"].to_numpy(), 1e-8)), pts["strike"].to_numpy()
+        clean = smile_inliers(pk, piv, pw, pstrike)  # outliers leave every fit, not just their own
+        pts = pts[clean]
+        pk, piv, pw, pstrike = pk[clean], piv[clean], pw[clean], pstrike[clean]
+        full = _fit(pk, piv, pw, pstrike)
+        in_fit = {label: j for j, label in enumerate(pts.index)}
+        for label in idx:
+            if label in in_fit:
+                m = np.ones(len(pts), dtype=bool)
+                m[in_fit[label]] = False
+                res = _fit(pk[m], piv[m], pw[m], pstrike[m])
+            else:
+                res = full
+            if res is None:
+                continue
+            coef, lo, hi = res
+            i = pos[label]
+            ref[i] = float(np.clip(np.polyval(coef, k[i]), 0.01, 5.0))
+            method[i] = "smile"
+            supported[i] = lo <= k[i] <= hi
+    df["ref_iv"], df["ref_method"], df["ref_supported"] = ref, method, supported
+    # Without a smile, show a near-the-money median for the worked example only; it is never
+    # used for a Rich/Cheap verdict.
     core = df[df["delta"].abs().between(0.3, 0.7) & df["otm"] & (df["iv_source"] == "mid")]
     med = core.groupby(["expiry", "type"])["iv"].median()
     fallback = pd.MultiIndex.from_arrays([df["expiry"], df["type"]]).map(med.get).astype(float)
@@ -305,10 +465,17 @@ def prepare_chain(raw: pd.DataFrame, spot: float, today=None,
     df.loc[need, "ref_method"] = "median"
     theo, _, _ = bs_model(S, df["strike"], T, r, q, df["ref_iv"], is_call)
     df["theo"] = theo
-    # Rich/Cheap is judged on out-of-the-money options only: in-the-money prices also carry
-    # intrinsic and early-exercise value that a European model does not price.
+    # Rich/Cheap only for out-of-the-money options with a live quote, an IV solved from that
+    # quote, and a supported smile reference. edge_note says why any other row has no edge.
+    eligible = (df["otm"] & (df["iv_source"] == "mid") & (df["ref_method"] == "smile")
+                & df["ref_supported"] & (df["mid"] > 0)).to_numpy()
     with np.errstate(all="ignore"):
-        df["edge_pct"] = np.where((df["mid"] > 0) & df["otm"], (df["theo"] - df["mid"]) / df["mid"] * 100.0, np.nan)
+        df["edge_pct"] = np.where(eligible, (df["theo"] - df["mid"]) / df["mid"] * 100.0, np.nan)
+    src = df["iv_source"].to_numpy()
+    df["edge_note"] = np.select(
+        [eligible, src == "crossed", src == "rejected", ~df["otm"].to_numpy(), src == "yahoo"],
+        ["", "crossed quote", "price outside model bounds", "in the money", "no live quote"],
+        default="smile lacks support at this strike")
 
     ad = df["delta"].abs()
     df["bucket"] = np.select(

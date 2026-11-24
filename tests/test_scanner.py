@@ -10,8 +10,10 @@ listed), edge cases, and the summary figures.
 from __future__ import annotations
 
 import math
+import os
 import random
 import sys
+import time
 from pathlib import Path
 
 import numpy as np
@@ -106,18 +108,22 @@ def test_prepare(chain: pd.DataFrame, spot: float):
           "edge sign disagrees with the IV gap")
     check(chain["iv"].between(0.01, 5, inclusive="neither").all(), "junk IVs not dropped")
     check((chain["dte"] >= 0).all(), "negative DTE kept")
-    two = (chain["bid"] > 0) & (chain["ask"] > 0)
+    two = (chain["bid"] > 0) & (chain["ask"] > 0) & (chain["ask"] >= chain["bid"])
+    check((chain["quote"] == "live").eq(two).all(), "quote flag disagrees with the live-quote rule")
     check(np.allclose(chain.loc[two, "mid"], (chain.loc[two, "bid"] + chain.loc[two, "ask"]) / 2), "mid != (bid+ask)/2")
-    check(chain.loc[~two, "spread_pct"].isna().all(), "spread shown without a two-sided quote")
+    check(chain.loc[~two, "spread_pct"].isna().all(), "spread shown without a live quote")
+    check((chain["spread_pct"].dropna() >= 0).all(), "negative spread")
     check((chain.loc[chain["type"] == "call", "delta"] >= 0).all(), "negative call delta")
     check((chain.loc[chain["type"] == "put", "delta"] <= 0).all(), "positive put delta")
     ad = chain["delta"].abs()
     want = np.select([ad < 0.15, ad < 0.35, ad < 0.65], ["Lotto", "Sensible", "Directional"], "Deep ITM")
     check((chain["bucket"] == want).all(), "bucket does not match delta rule")
-    ok = (chain["mid"] > 0) & chain["otm"]
+    ok = chain["edge_pct"].notna()
     edge = (chain["theo"] - chain["mid"]) / chain["mid"] * 100
-    check(np.allclose(chain.loc[ok, "edge_pct"], edge[ok], equal_nan=True), "edge % formula mismatch")
-    # reference IV = median IV of |delta| 0.3-0.7 contracts of the same expiry AND type
+    check(np.allclose(chain.loc[ok, "edge_pct"], edge[ok]), "edge % formula mismatch")
+    elig = chain["otm"] & (chain["iv_source"] == "mid") & (chain["ref_method"] == "smile") & chain["ref_supported"]
+    check(ok.eq(elig & (chain["mid"] > 0)).all(), "edge given outside the eligibility rule")
+    check((chain["edge_note"] == "").eq(ok).all(), "edge_note must be empty exactly when an edge exists")
     check(chain.loc[~chain["otm"], "edge_pct"].isna().all(), "in-the-money options must not get a Rich/Cheap edge")
     otm = np.where(chain["type"] == "call", chain["strike"] >= chain["spot_used"], chain["strike"] <= chain["spot_used"])
     check((chain["otm"].to_numpy() == otm).all(), "otm flag wrong")
@@ -125,15 +131,19 @@ def test_prepare(chain: pd.DataFrame, spot: float):
     for r in itm_pair.head(50).itertuples():  # ITM IV comes from the OTM option at the same strike
         twin = chain[(chain["expiry"] == r.expiry) & (chain["strike"] == r.strike) & chain["otm"]]
         check(len(twin) and abs(twin["iv"].mean() - r.iv) < 1e-12, f"pair IV mismatch at {r.strike}")
-    # reference IV: the expiry's fitted smile at this strike, else the near-the-money median
+    # reference IV: the expiry's smile at this strike, fitted WITHOUT the contract itself when it
+    # is one of the fitting points; supported only inside the strike range of the points used
     for exp, e in chain.groupby("expiry"):
-        fit = sc.fit_smile(e)
-        sm = e[e["ref_method"] == "smile"]
-        if fit is not None:
-            want = np.clip(np.polyval(fit, sm["moneyness"]), 0.01, 5.0)
-            check(len(sm) == len(e) and np.allclose(sm["ref_iv"], want), f"smile reference wrong for {exp:%Y-%m-%d}")
-        else:
-            check(sm.empty, f"{exp:%Y-%m-%d} has no smile fit but rows say smile")
+        pts = sc.smile_points(e).index
+        for label, r in e[e["ref_method"] == "smile"].head(40).iterrows():
+            res = sc.fit_smile(e, exclude=label if label in pts else None)
+            check(res is not None, f"{exp:%Y-%m-%d} K={r.strike}: marked smile but no fit")
+            if res is None:
+                continue
+            coef, lo, hi = res
+            check(abs(np.clip(np.polyval(coef, r.moneyness), 0.01, 5.0) - r.ref_iv) < 1e-9,
+                  f"{exp:%Y-%m-%d} K={r.strike}: smile reference wrong")
+            check(bool(r.ref_supported) == (lo <= r.moneyness <= hi), f"{exp:%Y-%m-%d} K={r.strike}: support flag wrong")
 
 
 def skewed_chain(spot=500.0, stale=1.0, bump=None):
@@ -268,27 +278,250 @@ def test_tkinter_tab(chain: pd.DataFrame):
         print("  (skipped Tkinter test:", exc, ")")
         return
     root.withdraw()
+    import tempfile
+    from unittest.mock import patch
     import scanner_tab
-    from tkinter import messagebox
-    warned = []
-    messagebox.showwarning = lambda *a, **k: warned.append(a)
-    tab = scanner_tab.ScannerTab(root)
-    tab._chain, tab._ticker = chain, "TEST"
-    for mode in sc.MODES:
-        tab.v["mode"].set(mode)
-        tab._refilter()
-        n = len(tab.tree.get_children())
-        check(n == min(len(tab._result), tab.MAX_ROWS), f"Tk rows shown {n} vs result {len(tab._result)} ({mode})")
-    for col in ("volume", "edge_pct", "signal", "theta"):
-        tab._sort_by(col)
-    tab.v["min_vol"].set("abc")
-    tab._refilter()
-    check(len(warned) == 1, "Tk tab did not warn on a non-numeric setting")
-    root.destroy()
+    from tkinter import filedialog, messagebox
+    said = []  # every dialog is stubbed so a headless run can never block on one
+    stubs = [patch.object(messagebox, name, lambda *a, n=name, **k: said.append(n))
+             for name in ("showwarning", "showinfo", "showerror")]
+    for st in stubs:
+        st.start()
+    try:
+        tab = scanner_tab.ScannerTab(root)
+        tab.v["ticker"].set("TEST")
+        deliver = lambda t, ch, win=(0, 45): (tab._queue.put(("ok", t, 100.0, ch, sc.summarize(ch, 100.0), win)), tab._poll())
+        deliver("TEST", chain)
+        check(str(tab.export_btn["state"]) == ("normal" if len(tab._result) else "disabled"), "Tk export state after scan")
+        for mode in sc.MODES:
+            tab.v["mode"].set(mode)
+            tab.refilter_btn.invoke()
+            n = len(tab.tree.get_children())
+            check(n == min(len(tab._result), tab.MAX_ROWS), f"Tk rows shown {n} vs result {len(tab._result)} ({mode})")
+        for col in ("volume", "edge_pct", "signal", "theta"):
+            tab._sort_by(col)
+        # filter-only change re-filters the cache
+        tab.v["mode"].set("Delta Bucket")
+        tab.v["min_vol"].set("0")
+        tab.refilter_btn.invoke()
+        before = len(tab._result)
+        check(before > 0 and tab._ticker == "TEST", "Tk filter-only change should re-filter the cached chain")
+        # ticker or DTE edits must not be applied to the old chain (TK-REFILTER-WINDOW)
+        for key, val in (("ticker", "AAPL"), ("max_dte", "7"), ("min_dte", "1")):
+            old = tab.v[key].get()
+            tab.v[key].set(val)
+            tab.refilter_btn.invoke()
+            check(len(tab.tree.get_children()) == 0 and str(tab.export_btn["state"]) == "disabled"
+                  and "Press Fetch & Scan" in tab.status.get() and tab.summary.get() == "",
+                  f"Tk Re-apply after changing {key} must clear the view and ask for a fresh fetch")
+            tab.v[key].set(old)
+            tab.refilter_btn.invoke()
+            check(len(tab._result) == before, f"Tk reverting {key} should restore the cached results")
+        # nonempty -> empty scan: no stale rows, export disabled, button cannot save old rows (TK-EMPTY-EXPORT)
+        deliver("EMPTY", chain.iloc[0:0])
+        with tempfile.TemporaryDirectory() as tmp, \
+                patch.object(filedialog, "asksaveasfilename", return_value=tmp + "/x.csv") as dialog:
+            tab.export_btn.invoke()
+            tab._export()  # even a direct call must refuse
+            check(dialog.call_count == 0 and not os.path.exists(tmp + "/x.csv"),
+                  "Tk empty scan must not export the previous ticker's rows")
+        check(len(tab.tree.get_children()) == 0 and str(tab.export_btn["state"]) == "disabled"
+              and tab._ticker == "EMPTY" and tab._result.empty, "Tk empty scan state")
+        # failure after a success clears the old rows too
+        deliver("TEST", chain)
+        tab._queue.put(("err", "No price data found for 'MISSING'."))
+        tab._poll()
+        check(tab._result.empty and str(tab.export_btn["state"]) == "disabled" and tab._ticker is None,
+              "Tk failed scan must clear the previous results and disable export")
+        # every invalid field is rejected on its own, before any fetch (TK-VALIDATION)
+        good = {"ticker": "SPY", "min_dte": "0", "max_dte": "45", "min_vol": "50", "min_oi": "10",
+                "uoa": "1.0", "edge": "5", "spread": "10", "min_price": "0.10"}
+        bad = [("ticker", "SPY;X"), ("ticker", "^ABCDEFGHIJKL"), ("ticker", " "), ("min_dte", "-2"),
+               ("max_dte", "999"), ("min_dte", "50"), ("min_vol", "-1"), ("min_vol", "1.5"), ("min_oi", "-1"),
+               ("uoa", "nan"), ("uoa", "abc"), ("edge", "inf"), ("spread", "1e309"), ("min_price", "-0.1")]
+        with patch.object(scanner_tab, "fetch_chain") as fetch:
+            for key, val in bad:
+                for k, v in good.items():
+                    tab.v[k].set(v)
+                tab.v[key].set(val)
+                n_warn = said.count("showwarning")
+                tab.scan_btn.invoke()
+                check(said.count("showwarning") == n_warn + 1 and not tab._busy,
+                      f"Tk accepted {key}={val!r}")
+            check(fetch.call_count == 0, f"Tk invalid input reached the provider: {fetch.call_args_list}")
+        for k, v in good.items():
+            tab.v[k].set(v)
+        tab.v["ticker"].set("  spy ")
+        with patch.object(scanner_tab, "fetch_chain", return_value=(100.0, chain, sc.summarize(chain, 100.0))) as fetch:
+            tab.scan_btn.invoke()
+            for _ in range(200):
+                if not tab._queue.empty():
+                    break
+                time.sleep(0.01)
+            tab._poll()
+            check(fetch.call_args[0] == ("SPY", 0, 45) and tab._ticker == "SPY", "Tk valid scan normalises the ticker")
+    finally:
+        for st in stubs:
+            st.stop()
+        root.destroy()
+
+
+def raw_row(k=100.0, kind="call", dte=30, bid=3.95, ask=4.05, last=4.0, iv=0.3, vol=100, oi=50):
+    return dict(strike=k, bid=bid, ask=ask, lastPrice=last, volume=vol, openInterest=oi,
+                impliedVolatility=iv, type=kind, expiry=(TODAY + pd.Timedelta(days=dte)).strftime("%Y-%m-%d"))
+
+
+def fair_row(k, kind, dte=30, spot=100.0, iv=0.25, factor=1.0, oi=50):
+    p = float(sc.bs_model(spot, k, max(dte, 0.5) / 365, sc.RISK_FREE_RATE, sc.DIVIDEND_YIELD, iv, kind == "call")[0]) * factor
+    return raw_row(k, kind, dte, p * 0.995, p * 1.005, p, iv, oi=oi)
+
+
+def test_quote_rule():
+    """DATA-CROSSED-QUOTE: crossed quotes never count as live: no spread, no Tight Spreads hit,
+    no IV from them, no effect on the parity spot. Locked quotes (bid == ask) are live."""
+    cases = {"crossed": (4.20, 3.80), "locked": (4.00, 4.00), "missing": (0.0, 0.0), "nan": (np.nan, 4.1), "valid": (3.95, 4.05)}
+    for name, (b, a) in cases.items():
+        ch = sc.prepare_chain(pd.DataFrame([raw_row(bid=b, ask=a)]), 100.0, TODAY)
+        r = ch.iloc[0]
+        want = {"crossed": "crossed", "locked": "live", "valid": "live"}.get(name, "none")
+        check(r.quote == want, f"{name} quote classified {r.quote}, expected {want}")
+        tight = sc.run_scans(ch, sc.ScanConfig(), "Tight Spreads")
+        check((len(tight) == 1) == (want == "live"), f"{name} quote: Tight Spreads returned {len(tight)} rows")
+        if want != "live":
+            check(math.isnan(r.spread_pct) and r.iv_source not in ("mid", "pair") and r.mid == 4.0,
+                  f"{name} quote must fall back to the last trade without a spread or a quote-solved IV")
+        else:
+            check(r.spread_pct >= 0, f"{name} spread {r.spread_pct}")
+    fair = [fair_row(k, kind) for k in (96, 98, 100, 102, 104) for kind in ("call", "put")]
+    base = sc.prepare_chain(pd.DataFrame(fair), 100.0, TODAY)["spot_used"].iloc[0]
+    bent = sc.prepare_chain(pd.DataFrame(fair + [raw_row(k=100.5, bid=9, ask=7), raw_row(k=100.5, kind="put", bid=.99, ask=1.01)]),
+                            100.0, TODAY)["spot_used"].iloc[0]
+    check(abs(bent - base) < 1e-9, f"a crossed pair moved the implied spot from {base:.4f} to {bent:.4f}")
+    lone = sc.prepare_chain(pd.DataFrame([raw_row(bid=9, ask=7), raw_row(kind="put", bid=.99, ask=1.01)]), 100.0, TODAY)
+    check((lone["spot_used"] == 100.0).all(), "crossed-only pairs must fall back to the quoted spot")
+
+
+def test_impossible_mid():
+    """DATA-IMPOSSIBLE-MID: a live quote no volatility can produce is 'rejected' and never Rich/Cheap,
+    while ordinary Rich and Cheap contracts in the same chain are still found."""
+    strikes = range(100, 124, 2)
+    # above any IV: an OTM $105 call at $150; below the zero-volatility value: an ITM $90 call at
+    # $9, under S - K*e^(-rT) = 10.37 (any positive price is reachable for an OTM option)
+    for k_bad, quote in ((105, (149.5, 150.5)), (90, (8.95, 9.05))):
+        rows = [fair_row(k, "call") for k in strikes]
+        rows.append(raw_row(k=k_bad, bid=quote[0], ask=quote[1], last=sum(quote) / 2, iv=0.30))
+        ch = sc.prepare_chain(pd.DataFrame(rows), 100.0, TODAY)
+        bad = ch[ch["strike"] == k_bad].iloc[0]
+        check(bad.iv_source == "rejected" and math.isnan(bad.edge_pct) and bad.edge_note == "price outside model bounds",
+              f"impossible mid at {k_bad}: source={bad.iv_source} edge={bad.edge_pct} note={bad.edge_note!r}")
+        out = sc.run_scans(ch, sc.ScanConfig(min_price=0), "Mispricing")
+        check(k_bad not in set(out["strike"]), f"impossible mid at {k_bad} produced a signal")
+    for factor, sign in ((1.3, "Rich"), (0.7, "Cheap")):  # controls: real mispricing still found
+        rows = [fair_row(k, "call", factor=factor if k == 104 else 1) for k in strikes]
+        out = sc.run_scans(sc.prepare_chain(pd.DataFrame(rows), 100.0, TODAY), sc.ScanConfig(), "Mispricing")
+        check(list(out["strike"]) == [104] and out["signal"].iloc[0].startswith(sign),
+              f"control {sign}: got {list(zip(out['strike'], out['signal']))}")
+
+
+def test_smile_contamination():
+    """CORE-SMILE-CONTAMINATION: an overpriced contract must not drag the smile and make a fair
+    neighbour look Cheap. With thin support the verdict is withheld; with dense support the
+    overpriced contract itself is flagged Rich, near its true -23% edge."""
+    strikes = (95, 97, 99, 101, 103, 105)
+    thin = lambda bump: sc.prepare_chain(pd.DataFrame(
+        [fair_row(k, "put" if k < 100 else "call", factor=bump if k == 105 else 1) for k in strikes]), 100.0, TODAY)
+    check(sc.run_scans(thin(1.0), sc.ScanConfig(), "Mispricing").empty, "clean thin chain produced signals")
+    ch = thin(1.3)
+    out = sc.run_scans(ch, sc.ScanConfig(), "Mispricing")
+    check(out.empty, f"thin chain: overpriced 105 call produced {list(zip(out['strike'], out['signal']))}")
+    check(ch.loc[ch["strike"] == 103, "edge_pct"].isna().all() or abs(ch.loc[ch["strike"] == 103, "edge_pct"].iloc[0]) < 1,
+          "fair 103 call must not be judged against a curve bent by the 105 call")
+    dense = sc.prepare_chain(pd.DataFrame(
+        [fair_row(k, "put" if k < 100 else "call", factor=1.3 if k == 105 else 1) for k in range(85, 117)]), 100.0, TODAY)
+    out = sc.run_scans(dense, sc.ScanConfig(), "Mispricing")
+    check(list(out["strike"]) == [105] and out["signal"].iloc[0].startswith("Rich"),
+          f"dense chain: expected only 105 Rich, got {list(zip(out['strike'], out['signal']))}")
+    if len(out):
+        check(abs(out["edge_pct"].iloc[0] - (1 / 1.3 - 1) * 100) < 2, f"105 edge {out['edge_pct'].iloc[0]:.2f}% vs true -23.08%")
+
+
+def test_fetch_partial():
+    """DATA-ABSENT-EXPIRY: missing legs or expiries keep the usable data and report coverage."""
+    from types import SimpleNamespace
+    from unittest.mock import patch
+    e1, e2 = (TODAY + pd.Timedelta(days=7)).strftime("%Y-%m-%d"), (TODAY + pd.Timedelta(days=30)).strftime("%Y-%m-%d")
+    good = lambda kind: pd.DataFrame([fair_row(k, kind, dte=30) for k in (96, 98, 100, 102, 104)]).drop(columns=["type", "expiry"])
+
+    def run(chains):
+        class T:
+            fast_info = {"last_price": 100.0}
+            options = [e1, e2]
+            def history(self, period):
+                return pd.DataFrame({"Close": [100.0] * 25})
+            def option_chain(self, exp):
+                c = chains[exp]
+                if isinstance(c, Exception):
+                    raise c
+                return c
+        with patch.dict(sys.modules, {"yfinance": SimpleNamespace(Ticker=lambda _: T())}), \
+                patch.object(sc, "market_today", return_value=TODAY):
+            return sc.fetch_chain("PART", 0, 45)
+
+    _, ch, s = run({e1: SimpleNamespace(calls=None, puts=None), e2: SimpleNamespace(calls=good("call"), puts=good("put"))})
+    check(len(ch) == 10 and s["expiries_scanned"] == 1 and s["expiries_missing"] == [e1], f"missing first expiry: {s}")
+    _, ch, s = run({e1: RuntimeError("timeout"), e2: SimpleNamespace(calls=good("call"), puts=pd.DataFrame())})
+    check(set(ch["type"]) == {"call"} and s["expiries_scanned"] == 1, "missing single leg and failing expiry")
+    try:
+        run({e1: SimpleNamespace(calls=None, puts=None), e2: None})
+        check(False, "all-missing window must raise a no-data error")
+    except ValueError as exc:
+        check("no option data" in str(exc), f"all-missing message: {exc}")
+
+
+def test_inputs_and_caps():
+    """API-SYMBOL-LENGTH, TK-VALIDATION (shared rules) and CORE-EXPIRY-CAP."""
+    for t, ok in (("spy", True), (" ^spx ", True), ("ABCDEFGHIJKL", True), ("^ABCDEFGHIJK", True),
+                  ("ABCDEFGHIJKLM", False), ("^ABCDEFGHIJKL", False), ("SPY;X", False), ("", False), ("^", False)):
+        try:
+            sc.normalize_ticker(t)
+            got = True
+        except ValueError:
+            got = False
+        check(got == ok, f"ticker {t!r}: accepted={got}")
+    base = dict(min_dte=0, max_dte=45, cfg=sc.ScanConfig())
+    sc.validate_settings(**base)
+    sc.validate_settings(0, 0, sc.ScanConfig(min_volume=0, min_oi=0, uoa_ratio=0, edge_pct=0, max_spread_pct=0, min_price=0))
+    bad = [dict(min_dte=-1), dict(max_dte=731), dict(min_dte=10, max_dte=5), dict(min_dte=1.5)]
+    for field in ("min_volume", "min_oi", "uoa_ratio", "edge_pct", "max_spread_pct", "min_price"):
+        bad += [{field: float("inf")}, {field: float("nan")}, {field: -1}]
+    for b in bad:
+        args = dict(base)
+        cfg_fields = {k: v for k, v in b.items() if k not in ("min_dte", "max_dte")}
+        args.update({k: v for k, v in b.items() if k in ("min_dte", "max_dte")})
+        args["cfg"] = sc.ScanConfig(**{**sc.ScanConfig().__dict__, **cfg_fields})
+        try:
+            sc.validate_settings(**args)
+            check(False, f"validate_settings accepted {b}")
+        except ValueError:
+            pass
+    check(sc.pick_expiries([], 12) == [] and sc.pick_expiries([0, 1, 2, 3], 1) == [0]
+          and sc.pick_expiries([0, 1, 2, 3], 2) == [0, 3], "pick_expiries small caps")
+    got = sc.pick_expiries(list(range(40)), 12)
+    check(len(got) == 12 and got[0] == 0 and got[-1] == 39, f"default cap coverage {got}")
+    try:
+        sc.pick_expiries([0, 1], 0)
+        check(False, "cap 0 must raise")
+    except ValueError:
+        pass
 
 
 if __name__ == "__main__":
     test_pricing()
+    test_quote_rule()
+    test_impossible_mid()
+    test_smile_contamination()
+    test_fetch_partial()
+    test_inputs_and_caps()
     test_implied_vol()
     test_tkinter_tab(sc.prepare_chain(synthetic_chain(9), 100.0, TODAY))
     for seed in range(5):

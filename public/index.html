@@ -157,7 +157,7 @@
   <form id="f">
     <fieldset>
       <legend>Scan Settings</legend>
-      <label><b>Ticker</b><input name="ticker" value="SPY" required maxlength="12" autocapitalize="characters">
+      <label><b>Ticker</b><input name="ticker" value="SPY" required maxlength="16" autocapitalize="characters">
         <small>The stock or ETF whose options you want to scan, e.g. SPY, AAPL.</small></label>
       <label><b>Scan Type</b><select name="mode"></select>
         <small>What kind of contract to look for. Explained below the buttons.</small></label>
@@ -171,13 +171,13 @@
         <small>Skip contracts that traded fewer than this many today (illiquid).</small></label>
       <label><b>Min Open Interest</b><input name="min_oi" type="number" min="0" required value="10">
         <small>Skip contracts with fewer than this many open positions (as of last close).</small></label>
-      <label><b>UOA Vol/OI &ge;</b><input name="uoa_ratio" type="number" min="0" required step="0.1" value="1.0">
+      <label><b>UOA Vol/OI &ge;</b><input name="uoa_ratio" type="number" min="0" required step="any" value="1.0">
         <small>Flag as unusual when today's volume is at least this multiple of open positions.</small></label>
-      <label><b>Edge % &ge;</b><input name="edge_pct" type="number" min="0" required step="0.5" value="5">
+      <label><b>Edge % &ge;</b><input name="edge_pct" type="number" min="0" required step="any" value="5">
         <small>Flag as mispriced when price differs from the model by at least this %.</small></label>
-      <label><b>Max Spread %</b><input name="max_spread_pct" type="number" min="0" required step="0.5" value="10">
+      <label><b>Max Spread %</b><input name="max_spread_pct" type="number" min="0" required step="any" value="10">
         <small>Widest bid-ask gap allowed, as % of price. Wide gaps cost you to trade.</small></label>
-      <label><b>Min Mid Price</b><input name="min_price" type="number" min="0" required step="0.05" value="0.10">
+      <label><b>Min Mid Price</b><input name="min_price" type="number" min="0" required step="any" value="0.10">
         <small>Ignore options cheaper than this per share ($0.10 = $10 per contract).</small></label>
     </fieldset>
     <div class="bar">
@@ -245,10 +245,10 @@ const BUCKETS = [
   ["Deep ITM", "Deep ITM: stock-like (> 0.65)"],
 ];
 const BUCKET_HELP = {
-  "Lotto": "Lotto (like a lottery ticket): |delta| below 0.15. Far out of the money, cheap, roughly under a 15% chance of finishing in the money. Usually expires worthless, but can pay many times its cost on a big move.",
-  "Sensible": "Sensible: |delta| 0.15–0.35. Out of the money but within reach; a balance of cost and odds.",
-  "Directional": "Directional: |delta| 0.35–0.65. Near the money; moves about half as much as the stock. The usual choice for a view on direction.",
-  "Deep ITM": "Deep ITM (in the money): |delta| above 0.65. Already worth a lot intrinsically and moves almost like the stock itself, with less time value to decay.",
+  "Lotto": "Lotto (like a lottery ticket): |delta| below 0.15. The option moves less than 15 cents per $1 in the stock. Usually far out of the money and cheap: often expires worthless, but can pay many times its cost on a big move.",
+  "Sensible": "Sensible: |delta| 0.15–0.35. Moves 15–35 cents per $1 in the stock. Usually out of the money but within reach; a balance of cost and sensitivity.",
+  "Directional": "Directional: |delta| 0.35–0.65. Moves about half as much as the stock. Usually near the money; the usual choice for a view on direction.",
+  "Deep ITM": "Deep ITM: |delta| above 0.65, so it moves almost like the stock. Usually in the money, but the group is set by delta alone: a long-dated or high-IV option can reach this delta even at the money.",
 };
 const num = (d, sign) => v => v == null ? "" :
   (sign && v > 0 ? "+" : "") + Number(v).toLocaleString("en-US", { minimumFractionDigits: d, maximumFractionDigits: d });
@@ -452,7 +452,8 @@ function renderSummary(t, s) {
       `strike nearest $${f(S)} = $${f(s.atm_strike)}\nIV at that strike = ${pct(s.atm_iv, 2)}`]);
     cards.push(["Expected move (1 sigma)", `±$${f(s.exp_move)}`,
       `About a 2-in-3 chance the price ends between $${f(S - s.exp_move)} and $${f(S + s.exp_move)} by that expiry (if the model's assumptions hold).`,
-      `Spot × IV × √(days ÷ 365)\n= ${f(S)} × ${f(s.atm_iv, 4)} × √(${d} ÷ 365)\n= ${f(S)} × ${f(s.atm_iv, 4)} × ${f(Math.sqrt(T), 4)}\n= ±${f(s.exp_move)}`]);
+      `Spot × IV × √(days ÷ 365)` + (d < 0.5 ? "  (days floored at 0.5 for an option expiring today)" : "") +
+      `\n= ${f(S)} × ${f(s.atm_iv, 4)} × √(${Math.max(d, 0.5)} ÷ 365)\n= ${f(S)} × ${f(s.atm_iv, 4)} × ${f(Math.sqrt(T), 4)}\n= ±${f(s.exp_move)}`]);
   }
   if (s.skew_25d != null) {
     cards.push(["25-delta skew", `${s.skew_25d > 0 ? "+" : ""}${f(s.skew_25d, 1)} vol pts`,
@@ -490,21 +491,26 @@ function showWorking(r) {
   const [d1, d2] = d12(S, K, T, rr, q, s);
   const steps = [];
   const add = (title, calc, meaning) => steps.push([title, calc, meaning]);
-  const two = r.bid > 0 && r.ask > 0;
+  // Same rule as the server: a quote is live only if bid and ask are positive and ask >= bid.
+  const two = r.quote ? r.quote === "live" : (r.bid > 0 && r.ask > 0 && r.ask >= r.bid);
+  const crossedQ = r.quote === "crossed";
 
   add("1. Mid price", two
       ? `Mid = (Bid + Ask) ÷ 2\n= (${f(r.bid)} + ${f(r.ask)}) ÷ 2 = ${f(r.mid, 3)}`
+      : crossedQ ? `The quote is crossed (bid ${f(r.bid)} above ask ${f(r.ask)}), which is not a real market,\nso Mid = last traded price = ${f(r.last, 3)}`
       : `No live bid and ask, so Mid = last traded price = ${f(r.last, 3)}`,
     `A fair estimate of the price per share. One contract = 100 shares = $${f(r.mid * 100)}.` + (two ? "" : " Last trade may be stale, so treat everything below with caution."));
 
   add("2. Spread %", two
       ? `(Ask − Bid) ÷ Mid × 100\n= (${f(r.ask)} − ${f(r.bid)}) ÷ ${f(r.mid, 3)} × 100 = ${f(r.spread_pct, 1)}%`
-      : "Not available (no two-sided quote).",
+      : crossedQ ? "Not available: a crossed quote has no meaningful spread." : "Not available (no two-sided quote).",
     "Roughly what you give up buying at the ask and later selling at the bid. Lower is cheaper to trade.");
 
   const intr = Math.max(isCall ? S - K : K - S, 0);
-  add("3. Intrinsic vs time value", `Intrinsic = max(${isCall ? "Spot − Strike" : "Strike − Spot"}, 0)\n= max(${isCall ? `${f(S)} − ${f(K)}` : `${f(K)} − ${f(S)}`}, 0) = ${f(intr)}\nTime value = Mid − Intrinsic = ${f(r.mid, 3)} − ${f(intr)} = ${f(r.mid - intr, 3)}`,
-    `${f(Math.max(r.mid - intr, 0) / r.mid * 100, 0)}% of this price is time value. That part shrinks to zero by expiry; theta (step 8) is its daily rate of decay.`);
+  const tv = r.mid - intr;
+  add("3. Intrinsic vs time value", `Intrinsic = max(${isCall ? "Spot − Strike" : "Strike − Spot"}, 0)\n= max(${isCall ? `${f(S)} − ${f(K)}` : `${f(K)} − ${f(S)}`}, 0) = ${f(intr)}\nTime value = Mid − Intrinsic = ${f(r.mid, 3)} − ${f(intr)} = ${f(tv, 3)}`,
+    tv > 0 ? `${f(tv / r.mid * 100, 0)}% of this price is time value. That part shrinks to zero by expiry; theta (step 8) is its daily rate of change.`
+           : "This price has no time value left above intrinsic value (an in-the-money price can even sit slightly below it), so there is little or nothing to decay.");
 
   add("4. Volume ÷ open interest", r.oi > 0
       ? `${num(0)(r.volume)} ÷ ${num(0)(r.oi)} = ${f(r.vol_oi, 2)}×`
@@ -519,6 +525,8 @@ function showWorking(r) {
     `σ = this contract's IV = ${f(s, 4)} ` +
     (r.iv_source === "mid" ? `(solved so Black-Scholes gives exactly the mid${r.iv_yahoo != null ? `; Yahoo shows ${f(r.iv_yahoo, 4)}` : ""})`
      : r.iv_source === "pair" ? `(taken from the out-of-the-money ${isCall ? "put" : "call"} at this strike: in-the-money prices include early-exercise value, which would inflate an IV solved from them)`
+     : r.iv_source === "rejected" ? "(Yahoo's figure, for display only: this quote's mid is outside what any volatility can produce, so it was rejected)"
+     : r.iv_source === "crossed" ? "(Yahoo's figure, for display only: the quote is crossed, bid above ask, so it was not used)"
      : "(Yahoo's figure: no live quote to solve from)") +
     `\nr = ${f(rr, 3)}, q = ${f(q, 3)}\n` +
     `d1 = [ln(S/K) + (r − q + σ²/2)·T] ÷ (σ·√T)\n= [ln(${f(S)}/${f(K)}) + (${f(rr, 3)} − ${f(q, 3)} + ${f(s * s / 2, 4)})·${f(T, 5)}] ÷ (${f(s, 4)}·${f(sq, 4)})\n= [${f(Math.log(S / K), 4)} + ${f((rr - q + s * s / 2) * T, 5)}] ÷ ${f(s * sq, 4)} = ${f(d1, 4)}\n` +
@@ -528,14 +536,22 @@ function showWorking(r) {
   add("7. Delta and bucket", (isCall ? `Delta = e^(−qT) × N(d1) = ${f(dq, 4)} × ${f(N(d1), 4)}` : `Delta = e^(−qT) × (N(d1) − 1) = ${f(dq, 4)} × (${f(N(d1), 4)} − 1)`) +
     ` = ${f(r.delta, 3)}\n|Δ| = ${f(Math.abs(r.delta), 3)} → ` +
     (Math.abs(r.delta) < 0.15 ? "below 0.15 → Lotto" : Math.abs(r.delta) < 0.35 ? "0.15 to 0.35 → Sensible" : Math.abs(r.delta) < 0.65 ? "0.35 to 0.65 → Directional" : "above 0.65 → Deep ITM"),
-    `N() is the normal-curve probability. A $1 move in the stock changes this option by about $${f(Math.abs(r.delta))}, and it has very roughly a ${f(Math.abs(r.delta) * 100, 0)}% chance of finishing in the money. ${BUCKET_HELP[r.bucket] || ""}`);
+    `N() is the normal-curve probability. Delta is price sensitivity: a $1 move in the stock changes this option by about $${f(Math.abs(r.delta))}. ` +
+    `It is not the same as the model's chance of finishing in the money, which uses d2: ${isCall ? "N(d2)" : "N(−d2)"} = ${f((isCall ? N(d2) : N(-d2)) * 100, 0)}%` +
+    (Math.abs(Math.abs(r.delta) - (isCall ? N(d2) : N(-d2))) < 0.05 ? " (close to delta here, as is usual for short-dated options)." : " (noticeably different from delta here: long expiries and high IV pull them apart).") +
+    ` ${BUCKET_HELP[r.bucket] || ""}`);
 
   const decay = -S * dq * npdf(d1) * s / (2 * sq);
   const carry = isCall ? -rr * K * dr * N(d2) + q * S * dq * N(d1) : rr * K * dr * N(-d2) - q * S * dq * N(-d1);
   add("8. Theta (time decay per day)",
     `Volatility part = −S·e^(−qT)·n(d1)·σ ÷ (2√T)\n= −${f(S)} × ${f(dq, 4)} × ${f(npdf(d1), 4)} × ${f(s, 4)} ÷ (2 × ${f(sq, 4)}) = ${f(decay, 3)} per year\n` +
     `Interest part = ${f(carry, 3)} per year\nTheta per day = (${f(decay, 3)} + ${f(carry, 3)}) ÷ 365 = ${f(r.theta, 4)}`,
-    `With price and IV unchanged, this option loses about $${f(Math.abs(r.theta), 3)} per share a day ($${f(Math.abs(r.theta) * 100)} per contract), which is ${f(Math.abs(r.theta) / r.mid * 100, 1)}% of its price. Note σ and √T: higher IV means more to decay, and dividing by √T makes decay speed up as expiry approaches.`);
+    (Math.abs(r.theta) < 0.0005
+      ? "With price and IV unchanged, this option's model value barely changes from one day to the next."
+      : r.theta < 0
+        ? `With price and IV unchanged, this option loses about $${f(-r.theta, 3)} per share a day ($${f(-r.theta * 100)} per contract), which is ${f(-r.theta / r.mid * 100, 1)}% of its price. Note σ and √T: higher IV means more to decay, and dividing by √T makes decay speed up as expiry approaches.`
+        : `Theta is positive here: with price and IV unchanged, the model value rises by about $${f(r.theta, 3)} per share a day ($${f(r.theta * 100)} per contract). ` +
+          "This happens for deep in-the-money puts (and some calls with dividends): the European model values them below intrinsic value because the strike is paid later, and that gap closes as expiry approaches."));
 
   add("9. Vega (sensitivity to IV)",
     `Vega = S·e^(−qT)·n(d1)·√T ÷ 100\n= ${f(S)} × ${f(dq, 4)} × ${f(npdf(d1), 4)} × ${f(sq, 4)} ÷ 100 = ${f(r.vega, 4)}`,
@@ -558,8 +574,17 @@ function showWorking(r) {
               : `Theo = K·e^(−rT)·N(−d2) − S·e^(−qT)·N(−d1)\n= ${f(K)} × ${f(dr, 4)} × ${f(N(-e2), 4)} − ${f(S)} × ${f(dq, 4)} × ${f(N(-e1), 4)}`) +
       ` = ${f(r.theo, 3)}`,
       "What Black-Scholes says this option is worth at the smile's IV for its strike.");
-    if (r.edge_pct == null) add("12. Edge %", "Not calculated: this option is in the money.",
-      "Rich/Cheap is judged only on out-of-the-money options. An in-the-money price also carries intrinsic value and early-exercise value that the European model does not price, so comparing it with Theo would mislead.");
+    if (r.edge_pct == null) {
+      const why = {
+        "in the money": ["Not calculated: this option is in the money.",
+          "Rich/Cheap is judged only on out-of-the-money options. An in-the-money price also carries intrinsic value and early-exercise value that the European model does not price, so comparing it with Theo would mislead."],
+        "crossed quote": ["Not calculated: the quote is crossed (bid above ask).", "A crossed quote is not a tradable market, so there is no reliable price to judge."],
+        "price outside model bounds": ["Not calculated: the quoted mid is outside what any volatility can produce.", "Such a quote is almost always a data error, so it is never reported as Rich or Cheap."],
+        "no live quote": ["Not calculated: there is no live bid and ask.", "The last trade can be stale, so it is not used for a Rich/Cheap verdict."],
+      }[r.edge_note] || ["Not calculated: the smile has too little support at this strike.",
+        "There are not enough other quoted strikes around this one (or it lies beyond the outermost ones) to build a reference without guessing, so the verdict is withheld."];
+      add("12. Edge %", why[0], why[1]);
+    }
     else add("12. Edge %", `(Theo − Mid) ÷ Mid × 100\n= (${f(r.theo, 3)} − ${f(r.mid, 3)}) ÷ ${f(r.mid, 3)} × 100 = ${r.edge_pct > 0 ? "+" : ""}${f(r.edge_pct, 1)}%`,
       (r.edge_pct > 0 ? "Positive: the market price is below the smile's price, so it is 'Cheap' versus its neighbours." : "Negative: the market price is above the smile's price, so it is 'Rich' versus its neighbours.") +
       " Rough check: edge ≈ IV gap × vega ÷ mid. Edges in the hundreds or thousands of % usually mean a bad or stale quote, not a bargain.");
@@ -567,14 +592,16 @@ function showWorking(r) {
 
   // why it was listed
   const tick = ok => ok ? "✓" : "✗";
-  const lines = [`Liquidity filter: volume ${num(0)(r.volume)} ≥ ${cfg.min_volume} ${tick(r.volume >= cfg.min_volume)}, OI ${num(0)(r.oi)} ≥ ${cfg.min_oi} ${tick(r.oi >= cfg.min_oi)}`];
+  const fin = v => v != null && isFinite(v);  // never let null coerce to 0 in a comparison
+  const lines = [`Liquidity filter: volume ${num(0)(r.volume)} ≥ ${cfg.min_volume} ${tick(fin(r.volume) && r.volume >= cfg.min_volume)}, OI ${num(0)(r.oi)} ≥ ${cfg.min_oi} ${tick(fin(r.oi) && r.oi >= cfg.min_oi)}`];
   const m = cfg.mode;
   if (m.includes("UOA") || m === "Unusual Activity")
-    lines.push(`UOA: Vol/OI ${f(r.vol_oi, 2)} ≥ ${cfg.uoa_ratio} ${tick(r.vol_oi >= cfg.uoa_ratio)}`);
+    lines.push(fin(r.vol_oi) ? `UOA: Vol/OI ${f(r.vol_oi, 2)} ≥ ${cfg.uoa_ratio} ${tick(r.vol_oi >= cfg.uoa_ratio)}`
+                             : `UOA: Vol/OI n/a (open interest is 0, so the ratio is undefined) ✗`);
   if (m.includes("Mispricing"))
-    lines.push(`Mispricing: |Δ| ${f(Math.abs(r.delta))} in 0.2–0.8 ${tick(Math.abs(r.delta) >= 0.2 && Math.abs(r.delta) <= 0.8)}, mid ${f(r.mid)} ≥ ${cfg.min_price} ${tick(r.mid >= cfg.min_price)}, spread ${r.spread_pct == null ? "n/a" : f(r.spread_pct, 1) + "%"} ≤ ${cfg.max_spread_pct}% ${tick(r.spread_pct != null && r.spread_pct <= cfg.max_spread_pct)}, |edge| ${r.edge_pct == null ? "n/a" : f(Math.abs(r.edge_pct), 1) + "%"} ≥ ${cfg.edge_pct}% ${tick(r.edge_pct != null && Math.abs(r.edge_pct) >= cfg.edge_pct)}`);
+    lines.push(`Mispricing: |Δ| ${f(Math.abs(r.delta))} in 0.2–0.8 ${tick(Math.abs(r.delta) >= 0.2 && Math.abs(r.delta) <= 0.8)}, mid ${f(r.mid)} ≥ ${cfg.min_price} ${tick(fin(r.mid) && r.mid >= cfg.min_price)}, spread ${fin(r.spread_pct) ? f(r.spread_pct, 1) + "%" : "n/a"} ≤ ${cfg.max_spread_pct}% ${tick(fin(r.spread_pct) && r.spread_pct <= cfg.max_spread_pct)}, |edge| ${fin(r.edge_pct) ? f(Math.abs(r.edge_pct), 1) + "%" : "n/a"} ≥ ${cfg.edge_pct}% ${tick(fin(r.edge_pct) && Math.abs(r.edge_pct) >= cfg.edge_pct)}`);
   if (m === "Tight Spreads")
-    lines.push(`Tight spread: spread ${f(r.spread_pct, 1)}% ≤ ${cfg.max_spread_pct}% ✓, mid ${f(r.mid)} ≥ ${cfg.min_price} ✓`);
+    lines.push(`Tight spread: spread ${f(r.spread_pct, 1)}% ≤ ${cfg.max_spread_pct}% ${tick(fin(r.spread_pct) && r.spread_pct <= cfg.max_spread_pct)}, mid ${f(r.mid)} ≥ ${cfg.min_price} ${tick(fin(r.mid) && r.mid >= cfg.min_price)}`);
   if (m === "Delta Bucket")
     lines.push(`Bucket: ${r.bucket}${cfg.bucket === "All" ? " (all buckets shown)" : ` = ${cfg.bucket} ✓`}, mid ${f(r.mid)} ≥ ${cfg.min_price} ✓`);
   add(`${steps.length + 1}. Why it was listed`, lines.join("\n") + `\nSignal: ${r.signal}`,
@@ -597,14 +624,28 @@ function fieldError(e) {
     : e.type === "string_too_long" ? "is too long" : e.type === "string_too_short" ? "is required" : e.msg;
   return `${FIELD_LABEL[f] || f}: ${what}.`;
 }
+function clearResults() {
+  data = null; rows = []; sortKey = null; selected = null; marketDrawnFor = null;
+  $("body").innerHTML = "";
+  $("cards").innerHTML = "";
+  $("marketCharts").textContent = "";
+  $("contractCharts").textContent = "";
+  $("steps").innerHTML = "";
+  $("sumBox").hidden = true;
+  $("sumTicker").textContent = "";
+  $("workBox").hidden = true;
+  $("warn").hidden = true;
+  $("export").disabled = true;
+}
 function setStatus(msg, err) { $("status").textContent = msg; $("status").classList.toggle("err", !!err); }
 
 form.addEventListener("submit", async e => {
   e.preventDefault();
   const params = new URLSearchParams(new FormData(form));
   params.set("ticker", params.get("ticker").trim().toUpperCase());
-  if (!/^\^?[A-Z0-9][A-Z0-9.\-=]{0,11}$/.test(params.get("ticker")))
-    return setStatus("Please enter a ticker symbol such as SPY, AAPL, BRK-B or ^SPX (letters, digits, '.', '-', '^' or '=' only).", true);
+  // Same symbol rule as the server (scanner_core.TICKER_RE): 1-12 characters after trimming, ^ included.
+  if (!/^(?=.{1,12}$)\^?[A-Z0-9][A-Z0-9.\-=]*$/.test(params.get("ticker")))
+    return setStatus("Please enter a ticker symbol such as SPY, AAPL, BRK-B or ^SPX (up to 12 characters: letters, digits, '.', '-', '^' or '=').", true);
   if (+params.get("min_dte") > +params.get("max_dte")) return setStatus("Min DTE must not exceed Max DTE.", true);
   $("scan").disabled = true;
   setStatus(`Fetching option chains for ${params.get("ticker")}...`);
@@ -638,10 +679,12 @@ form.addEventListener("submit", async e => {
     render();
     $("export").disabled = !rows.length;
     const sm = d.summary, partial = sm.expiries_in_window > sm.expiries_scanned;
+    const missing = (sm.expiries_missing || []).length;
     setStatus(`${rows.length} signals from ${d.contracts} contracts across ${sm.expiries_scanned ?? d.expiries.length} expiries` +
-      (partial ? ` (a spread of ${sm.expiries_scanned} of the ${sm.expiries_in_window} in your DTE window)` : "") +
+      (partial ? ` (${sm.expiries_scanned} of the ${sm.expiries_in_window} in your DTE window${missing ? `; Yahoo returned no data for ${missing}` : ""})` : "") +
       `, showing ${Math.min(rows.length, 500)}` + (d.cached ? ", cached chain." : "."));
   } catch (err) {
+    clearResults();  // never leave an earlier ticker's results (and export) looking current
     setStatus("Scan failed: " + err.message, true);
   } finally {
     $("scan").disabled = false;

@@ -24,7 +24,8 @@ from tkinter import filedialog, messagebox, ttk
 
 import pandas as pd
 
-from scanner_core import BUCKETS, MODES, ScanConfig, fetch_chain, format_summary, run_scans
+from scanner_core import (BUCKETS, MODES, ScanConfig, fetch_chain, format_summary, normalize_ticker,
+                          run_scans, validate_settings)
 
 # --------------------------------------------------------------------------
 # 5. UI
@@ -74,6 +75,8 @@ class ScannerTab(ttk.Frame):
         self._busy = False
         self._chain = pd.DataFrame()
         self._result = pd.DataFrame()
+        self._ticker = None      # ticker of the chain in self._chain (and of any export)
+        self._window = None      # (min_dte, max_dte) that chain was fetched for
         self._sort_col = None
         self._sort_desc = True
         self._build()
@@ -153,33 +156,36 @@ class ScannerTab(ttk.Frame):
 
     # ---- settings -------------------------------------------------------
     def _read_config(self) -> tuple[ScanConfig, int, int]:
+        """Parse and validate every setting, naming the field that is wrong (ValueError)."""
         v = self.v
-        try:
-            cfg = ScanConfig(
-                min_volume=int(v["min_vol"].get()),
-                min_oi=int(v["min_oi"].get()),
-                uoa_ratio=float(v["uoa"].get()),
-                edge_pct=float(v["edge"].get()),
-                max_spread_pct=float(v["spread"].get()),
-                min_price=float(v["min_price"].get()),
-                bucket=v["bucket"].get(),
-            )
-            min_dte, max_dte = int(v["min_dte"].get()), int(v["max_dte"].get())
-        except ValueError:
-            raise ValueError("Please enter valid numbers in the scan settings.")
-        if min_dte > max_dte:
-            raise ValueError("Min DTE must not exceed Max DTE.")
+
+        def parse(key, label, kind):
+            text = v[key].get().strip()
+            try:
+                return kind(text)
+            except ValueError:
+                word = "a whole number" if kind is int else "a number"
+                raise ValueError(f"{label}: enter {word}.") from None
+
+        cfg = ScanConfig(
+            min_volume=parse("min_vol", "Min Volume", int),
+            min_oi=parse("min_oi", "Min Open Interest", int),
+            uoa_ratio=parse("uoa", "UOA Vol/OI", float),
+            edge_pct=parse("edge", "Edge %", float),
+            max_spread_pct=parse("spread", "Max Spread %", float),
+            min_price=parse("min_price", "Min Mid Price", float),
+            bucket=v["bucket"].get(),
+        )
+        min_dte, max_dte = parse("min_dte", "Min DTE", int), parse("max_dte", "Max DTE", int)
+        validate_settings(min_dte, max_dte, cfg)  # same rules as the web API
         return cfg, min_dte, max_dte
 
     # ---- actions --------------------------------------------------------
     def _start_scan(self):
         if self._busy:
             return
-        ticker = self.v["ticker"].get().strip().upper()
-        if not ticker:
-            messagebox.showwarning("Scanner", "Please enter a ticker.")
-            return
         try:
+            ticker = normalize_ticker(self.v["ticker"].get())
             _, min_dte, max_dte = self._read_config()
         except ValueError as exc:
             messagebox.showwarning("Scanner", str(exc))
@@ -192,7 +198,7 @@ class ScannerTab(ttk.Frame):
     def _worker(self, ticker, min_dte, max_dte):
         try:
             spot, chain, summary = fetch_chain(ticker, min_dte, max_dte)
-            self._queue.put(("ok", ticker, spot, chain, summary))
+            self._queue.put(("ok", ticker, spot, chain, summary, (min_dte, max_dte)))
         except Exception as exc:  # surfaced to the UI thread
             self._queue.put(("err", str(exc)))
 
@@ -203,29 +209,68 @@ class ScannerTab(ttk.Frame):
                 self._busy = False
                 self.scan_btn.configure(state="normal")
                 if msg[0] == "err":
-                    self.status.set("Scan failed.")
+                    # A failed scan must not leave the previous ticker's rows exportable.
+                    self._clear_view(f"Scan failed: {msg[1]}")
+                    self._chain, self._ticker, self._window = pd.DataFrame(), None, None
+                    self.summary.set("")
+                    self.refilter_btn.configure(state="disabled")
                     messagebox.showerror("Scanner", msg[1])
                 else:
-                    _, ticker, spot, chain, summary = msg
-                    self._chain = chain
-                    self._ticker = ticker
+                    _, ticker, spot, chain, summary, *rest = msg
+                    window = rest[0] if rest else self._entry_window()
+                    # Replace everything tied to a scan together: chain, ticker, window,
+                    # summary, result, sort state and button states.
+                    self._chain, self._ticker, self._window = chain, ticker, window
                     self.summary.set(self._format_summary(ticker, summary))
-                    self._refilter()
+                    self._apply_filters()
         except queue.Empty:
             pass
         if self.winfo_exists():
             self.after(100, self._poll)
 
-    def _refilter(self):
-        if self._chain.empty:
-            self.status.set("No usable contracts returned.")
-            self._render(self._chain.assign(signal=""))
-            return
+    def _entry_window(self):
         try:
-            cfg, _, _ = self._read_config()
+            return int(self.v["min_dte"].get()), int(self.v["max_dte"].get())
+        except ValueError:
+            return None
+
+    def _clear_view(self, status: str):
+        self._result = pd.DataFrame()
+        self._sort_col = None
+        self._render(self._result)
+        self.export_btn.configure(state="disabled")
+        self.status.set(status)
+
+    def _refilter(self):
+        """Re-apply Filters: re-run the scan rules on the cached chain, but only while the ticker
+        and DTE window in the entries are still the ones that chain was fetched for."""
+        try:
+            cfg, min_dte, max_dte = self._read_config()
+            ticker = normalize_ticker(self.v["ticker"].get())
         except ValueError as exc:
             messagebox.showwarning("Scanner", str(exc))
             return
+        if self._ticker is not None and (ticker, (min_dte, max_dte)) != (self._ticker, self._window):
+            # The visible rows no longer match the entries: clear them rather than mislabel them.
+            old = f"{self._ticker}, {self._window[0]}-{self._window[1]} DTE" if self._window else self._ticker
+            self._clear_view(f"Ticker or DTE window changed since the last fetch ({old}). "
+                             f"Press Fetch & Scan to load {ticker}, {min_dte}-{max_dte} DTE.")
+            self.summary.set("")
+            return
+        self._apply_filters(cfg)
+
+    def _apply_filters(self, cfg: ScanConfig | None = None):
+        if self._chain.empty:
+            self._clear_view("No usable contracts returned.")
+            self.refilter_btn.configure(state="disabled")
+            return
+        if cfg is None:
+            try:
+                cfg, _, _ = self._read_config()
+            except ValueError as exc:
+                self._clear_view(str(exc))
+                messagebox.showwarning("Scanner", str(exc))
+                return
         self._result = run_scans(self._chain, cfg, self.v["mode"].get())
         self._sort_col = None
         self._render(self._result)
@@ -251,12 +296,12 @@ class ScannerTab(ttk.Frame):
         self._render(self._result)
 
     def _export(self):
-        if self._result.empty:
+        if self._result.empty or self._ticker is None:
             return
         path = filedialog.asksaveasfilename(
             defaultextension=".csv",
             filetypes=[("CSV files", "*.csv")],
-            initialfile=f"{getattr(self, '_ticker', 'scan')}_scanner_{date.today():%Y%m%d}.csv",
+            initialfile=f"{self._ticker}_scanner_{date.today():%Y%m%d}.csv",
         )
         if path:
             self._result.to_csv(path, index=False)

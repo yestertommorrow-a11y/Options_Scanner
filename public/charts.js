@@ -317,6 +317,17 @@
 
   const C1 = "var(--s1)", C2 = "var(--s2)";
 
+  // Draw one chart; if it throws, show a note in its own card instead of losing every chart.
+  function safe(host, title, draw) {
+    try { draw(); } catch (err) {
+      console.error(err);
+      host.textContent = "";
+      host.classList.add("chart");
+      htmlEl("h3", "", host, title);
+      htmlEl("p", "note", host, "This chart could not be drawn for this data.");
+    }
+  }
+
   // =====================================================================
   // Market-level charts
   // =====================================================================
@@ -327,13 +338,14 @@
     const grid = htmlEl("div", "charts", root);
 
     // 1. Expected move as a probability curve
-    {
+    const emHost = htmlEl("div", "", grid);
+    safe(emHost, "Where the price could be at expiry", () => {
       const T = Math.max(s.dte, 0.5) / 365, D = dist(S, T, r, q, s.atm_iv), em = s.exp_move;
       const xs = range(S * Math.exp(-3.2 * D.v), S * Math.exp(3.2 * D.v), 161);
       const pts = xs.map(x => [x, D.pdf(x)]);
       const pIn = D.below(S + em) - D.below(S - em);
       const exp = (d.expiries.find(e => e.dte === s.dte) || {}).expiry || `${s.dte} days`;
-      lineChart(htmlEl("div", "", grid), {
+      lineChart(emHost, {
         title: "Where the price could be at expiry",
         sub: `${exp} · using ATM IV ${pc(s.atm_iv)}`,
         series: [{ name: "Likelihood", color: C1, pts }],
@@ -347,21 +359,25 @@
           `The shaded band (${usd(S - em)} to ${usd(S + em)}) is the "1-sigma expected move" and holds about ${pc(pIn, 0)} of outcomes. ` +
           `Higher IV or more days left would stretch the whole curve wider, which is exactly why those options cost more.`,
       });
-    }
+    });
 
-    // 2. IV vs realised volatility
+    // 2. IV vs realised volatility (the ratio is undefined when the stock has not moved: RV = 0)
     if (s.rv20 != null) {
-      barChart(htmlEl("div", "", grid), {
+      const ratio = s.iv_rv != null && isFinite(s.iv_rv) ? s.iv_rv : null;
+      const rvHost = htmlEl("div", "", grid);
+      safe(rvHost, "What options expect vs what actually happened", () => barChart(rvHost, {
         title: "What options expect vs what actually happened",
-        sub: `IV ÷ RV = ${s.iv_rv.toFixed(2)}`,
+        sub: ratio != null ? `IV ÷ RV = ${ratio.toFixed(2)}` : "IV ÷ RV unavailable: realised volatility is 0",
         cats: ["Implied (ATM IV)", "Realised (last 20 days)"],
         series: [{ name: "Volatility", color: C1, vals: [s.atm_iv * 100, s.rv20 * 100] }],
         fmtY: v => v.toFixed(1).replace(".0", "") + "%", yTitle: "Annualised volatility", valueLabels: true,
         tip: i => ({ header: i ? "Realised volatility" : "Implied volatility", rows: [{ value: pc(i ? s.rv20 : s.atm_iv), label: i ? "actual movement, annualised" : "movement priced into options" }] }),
-        caption: s.iv_rv > 1
+        caption: ratio == null
+          ? `Options are priced for ${pc(s.atm_iv)} a year of movement, but the stock's closing price has not changed over the last 20 days, so realised volatility is 0 and the IV ÷ RV ratio is undefined.`
+          : ratio > 1
           ? `Options are priced for ${pc(s.atm_iv)} a year of movement, but the stock has actually moved ${pc(s.rv20)}. Buyers are paying for more movement than recently seen; if calm continues, time decay works for option sellers.`
           : `Options are priced for ${pc(s.atm_iv)} a year of movement, less than the ${pc(s.rv20)} the stock has actually moved lately. Options look cheap versus recent movement; if that movement continues, buyers can outrun time decay.`,
-      });
+      }));
     }
 
     // shared expiry picker for the smile and activity charts
@@ -379,7 +395,9 @@
 
     function drawExpiry() {
       const ex = sel.value, e = d.expiries.find(x => x.expiry === ex);
-      const T = Math.max(e.dte, 0.5) / 365, band = Math.max(3 * s.atm_iv * Math.sqrt(T), 0.05);
+      // Each expiry has its own option-implied price and ATM IV; use them, not the summary's.
+      const S = e.spot ?? s.spot, atm = e.atm_iv ?? s.atm_iv;
+      const T = Math.max(e.dte, 0.5) / 365, band = Math.max(3 * atm * Math.sqrt(T), 0.05);
       const lo = S * Math.exp(-band), hi = S * Math.exp(band);
       const rows = d.chain.filter(c => c[0] === ex && c[2] >= lo && c[2] <= hi);
       const lo2 = S * Math.exp(-band * 2 / 3), hi2 = S * Math.exp(band * 2 / 3);
@@ -387,7 +405,7 @@
       // 3. Volatility smile (out-of-the-money side of each type)
       const calls = rows.filter(c => c[1] === "c" && c[2] >= S * 0.98).sort((a, b) => a[2] - b[2]).map(c => [c[2], c[3] * 100]);
       const puts = rows.filter(c => c[1] === "p" && c[2] <= S * 1.02).sort((a, b) => a[2] - b[2]).map(c => [c[2], c[3] * 100]);
-      if (calls.length > 1 && puts.length > 1) {
+      if (calls.length > 1 && puts.length > 1) safe(smileHost, "Volatility smile: IV at each strike", () => {
         const dots = [];
         if (e.dte === s.dte && s.p25_iv != null) {
           dots.push({ x: s.p25_strike, y: s.p25_iv * 100, color: C2, label: "25Δ put" });
@@ -407,7 +425,7 @@
             (dots.length ? ` The 25-delta skew card is the height gap between the two dots (${(s.p25_iv * 100).toFixed(1)}% − ${(s.c25_iv * 100).toFixed(1)}%).` : "") +
             " Rich/Cheap fits a smooth curve through these points and flags only contracts that sit off it, so the tilt itself is never called mispricing.",
         });
-      } else smileHost.textContent = "";
+      }); else smileHost.textContent = "";
 
       // 4. Volume vs open interest by strike
       const want = typ.value;
@@ -420,7 +438,7 @@
         by.set(c[2], a);
       }
       const strikes = [...by.keys()].sort((a, b) => a - b);
-      if (strikes.length) {
+      if (strikes.length) safe(actHost, "Activity by strike: traded today vs open positions", () => {
         const vol = strikes.map(k => by.get(k)[0]), oi = strikes.map(k => by.get(k)[1]);
         const flags = strikes.map(k => by.get(k)[2]);
         const pos = strikes.findIndex(k => k >= S);
@@ -439,7 +457,7 @@
             `▲ marks strikes with at least one contract passing your UOA settings (volume ≥ ${cfg.min_volume}, OI ≥ ${cfg.min_oi}, Vol/OI ≥ ${cfg.uoa_ratio}). The busiest strike today is ${usd(top[0], 0)}. ` +
             "Open interest tends to pile up at round-number strikes, where many traders hold positions.",
         });
-      } else actHost.textContent = "";
+      }); else actHost.textContent = "";
     }
     sel.addEventListener("change", drawExpiry);
     typ.addEventListener("change", drawExpiry);
@@ -470,6 +488,7 @@
       const today = xs.map(x => [x, bs(x, K, T, r, q, iv, isCall) - mid]);
       const be = isCall ? K + mid : K - mid;
       const tvNow = bs(S, K, T, r, q, iv, isCall) - intr;
+      const below = tvNow < -1e-6;  // European model value under intrinsic (deep ITM puts)
       lineChart(htmlEl("div", "", grid), {
         title: "Profit or loss if you buy one at the mid",
         sub: `Cost ${usd(mid)} per share = ${usd(mid * 100)} per contract`,
@@ -483,8 +502,11 @@
           { color: C2, value: sUsd(near[1][1]), label: "today" },
           { value: usd(Math.max(near[1][1] - near[0][1], 0)), label: "gap = time value" }] }),
         caption: `Blue is your result on expiry day: the most you can lose is what you paid (${usd(mid * 100)} per contract), and you need the stock ${word} ${usd(be)} to profit. ` +
-          `Orange is what the option is worth today at each price. The gap between the lines is time value (${usd(Math.max(tvNow, 0))} at today's price). ` +
-          "Every day, orange sinks toward blue: that sinking is time decay.",
+          (below
+            ? `Orange is the model value today. At today's price it sits ${usd(-tvNow)} BELOW intrinsic value: the European model discounts the strike you would receive later. ` +
+              "As expiry approaches, orange rises toward blue, which is why theta is positive here."
+            : `Orange is what the option is worth today at each price. The gap between the lines is time value (${usd(Math.max(tvNow, 0))} at today's price). ` +
+              "As days pass with the price unchanged, orange sinks toward blue: that sinking is time decay."),
       });
     }
 
@@ -506,7 +528,10 @@
           { color: C1, value: usd(val(t)), label: "option value" },
           { value: usd(val(t) - intr), label: "time value" },
           { value: sUsd(val(Math.max(t - 1, 0)) - val(t)), label: "change over the next day (theta)" }] }),
-        caption: tv0 <= 1e-6 ? "This option has almost no time value left, so there is little to decay."
+        caption: tv0 < -1e-6
+          ? `With nothing else changing, the model value RISES from ${usd(val(D))} to ${usd(intr)} (intrinsic value) at expiry: today it sits below intrinsic ` +
+            `because the European model discounts the strike paid later, and that gap closes over time. Today's slope is theta: ${sUsd(row.theta)} per day.`
+          : tv0 <= 1e-6 ? "This option has almost no time value left, so there is little to decay."
           : `With nothing else changing, the value slides from ${usd(val(D))} to ${usd(intr)} at expiry. ` +
             `${pc(first, 0)} of the time value goes in the first half of the remaining days and ${pc(1 - first, 0)} in the second half` +
             (first < 0.5 ? ": decay speeds up near expiry, which is why short-dated options lose value fastest." :
@@ -521,6 +546,7 @@
       const lo = Math.min(S * Math.exp(-3.5 * D.v), K * 0.98), hi = Math.max(S * Math.exp(3.5 * D.v), K * 1.02);
       const pts = range(lo, hi, 181).map(x => [x, D.pdf(x)]);
       const p = isCall ? 1 - D.below(K) : D.below(K);
+      const ad = Math.abs(row.delta), close = Math.abs(ad - p) < 0.05;
       lineChart(htmlEl("div", "", grid), {
         title: "Chance of finishing in the money",
         sub: `Model odds using this contract's IV (${pc(iv)})`,
@@ -531,8 +557,10 @@
         tip: x => ({ header: `Price ${usd(x)}`, rows: [
           { value: pc(D.below(x)), label: "chance of ending below" }, { value: pc(1 - D.below(x)), label: "chance of ending above" }] }),
         caption: `The shaded area is the chance the stock ends ${word} the ${usd(K, 0)} strike: ${pc(p, 0)}. ` +
-          `This option's delta is ${Math.abs(row.delta).toFixed(2)}, close to that figure, which is why traders read delta as rough odds. ` +
-          `That is how the buckets work: ${row.bucket} means |delta| ${row.bucket === "Lotto" ? "below 0.15, so long odds" : row.bucket === "Sensible" ? "0.15–0.35" : row.bucket === "Directional" ? "0.35–0.65, close to a coin flip" : "above 0.65, likely to finish in the money"}. ` +
+          `Delta (${ad.toFixed(2)}) is a different number: how much the option moves per $1 in the stock. ` +
+          (close ? "Here the two are close, as is usual for short-dated options, which is why traders use delta as rough odds. "
+                 : "Here they differ a lot, because a long time or a high IV pulls delta (from d1) and these odds (from d2) apart, so delta is not a good stand-in for odds on this contract. ") +
+          `The bucket is set by delta alone: ${row.bucket} means |delta| ${row.bucket === "Lotto" ? "below 0.15" : row.bucket === "Sensible" ? "0.15–0.35" : row.bucket === "Directional" ? "0.35–0.65" : "above 0.65"}. ` +
           "Higher IV or more time flattens the curve and spreads the shading, raising the odds of far strikes.",
       });
     }
@@ -554,7 +582,11 @@
         caption: `Higher IV means more expected movement, so the price curve rises. Its slope is vega: about ${usd(row.vega, 3)} per IV point here. ` +
           (ref == null ? "There is no reference IV for this expiry, so no Rich/Cheap verdict." :
            row.edge_pct == null ? `The orange dot prices the option at the smile's IV for this strike: ${usd(row.theo)}. ` +
-            "No Rich/Cheap verdict: the option is in the money, and its price includes early-exercise value the model does not capture." :
+            ({ "in the money": "No Rich/Cheap verdict: the option is in the money, and its price includes early-exercise value the model does not capture.",
+               "crossed quote": "No Rich/Cheap verdict: the quote is crossed (bid above ask).",
+               "price outside model bounds": "No Rich/Cheap verdict: the quoted price is outside what any volatility can produce.",
+               "no live quote": "No Rich/Cheap verdict: there is no live bid and ask." }[row.edge_note]
+             || "No Rich/Cheap verdict: the smile has too little support at this strike.") :
             `The orange dot prices the option at the smile's IV for this strike: ${usd(row.theo)}. The market mid is ${usd(mid)}, so edge = ${row.edge_pct > 0 ? "+" : ""}${row.edge_pct.toFixed(1)}%: ` +
             (row.edge_pct > 0 ? "the market charges less than the options around it imply (Cheap)." : "the market charges more than the options around it imply (Rich)."))
           + " The horizontal distance between the dots is the IV gap that edge % expresses in dollars.",
